@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.vextheater</id>
+  <name>VexTheater</name>
+  <summary>Full-screen TV launcher for GNOME</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      VexTheater turns a GNOME session into a living-room TV interface: a row of large
+      tiles for streaming apps, web apps and games, driven by keyboard, mouse or TV
+      remote. Leaving it shows the normal GNOME desktop, and the home key brings it
+      back.
+    </p>
+    <p>
+      Tiles are declared in a JSON file, which the bundled NixOS module generates from
+      Nix options.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.vextheater.desktop</launchable>
+  <url type="homepage">https://github.com/VictoryTek/VexTheater</url>
+  <url type="bugtracker">https://github.com/VictoryTek/VexTheater/issues</url>
+  <developer id="io.github.victorytek">
+    <name>VictoryTek</name>
+  </developer>
+
+  <releases>
+    <release version="0.1.0" date="2026-10-21">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

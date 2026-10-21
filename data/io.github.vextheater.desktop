@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Theater Mode
+Comment=Full-screen TV launcher
+Exec=vextheater
+Icon=io.github.vextheater
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;
+Keywords=tv;htpc;launcher;theater;media;
+StartupNotify=true
+X-GNOME-UsesNotifications=false

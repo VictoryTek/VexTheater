@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/vextheater">
+    <file alias="style.css">style.css</file>
+    <file alias="icons/hicolor/scalable/apps/io.github.vextheater.svg">icons/hicolor/scalable/apps/io.github.vextheater.svg</file>
+  </gresource>
+</gresources>

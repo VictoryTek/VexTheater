@@ -1,0 +1,90 @@
+/* VexTheater stylesheet. Sizes are logical pixels: GNOME's display scale turns them
+   into device pixels, so a 4K TV at 200% renders the same layout at full sharpness. */
+
+.theater {
+  background-color: #000000;
+  color: #ffffff;
+}
+
+.plain-background {
+  background-image: linear-gradient(90deg, #08142a 0%, #0e0b18 50%, #1f0a0d 100%);
+}
+
+/* Darkens the lower part of the wallpaper so tiles and text stay readable. */
+.scrim {
+  background-image: linear-gradient(to top,
+    rgba(0, 0, 0, 0.9) 0%, rgba(0, 0, 0, 0.6) 34%, rgba(0, 0, 0, 0) 62%);
+}
+
+.greeting {
+  font-size: 44px;
+  font-weight: 600;
+  letter-spacing: -0.5px;
+}
+
+.clock {
+  font-size: 56px;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+  letter-spacing: -1px;
+}
+
+.subtitle,
+.date,
+.tile-description {
+  font-size: 22px;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.subtitle {
+  font-size: 20px;
+}
+
+.tile-name {
+  font-size: 36px;
+  font-weight: 600;
+}
+
+.hint {
+  font-size: 18px;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.keycap {
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 8px;
+  padding: 3px 10px;
+}
+
+/* ── Tiles ────────────────────────────────────────────────────────────────────
+   `button.tile` outranks libadwaita's own button rules, including :hover and the
+   focus outline: the selected tile is shown by the ring and the lift instead. */
+
+button.tile {
+  min-width: 200px;
+  min-height: 200px;
+  padding: 0;
+  border-radius: 32px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background-color: rgba(255, 255, 255, 0.08);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  outline: none;
+  transition: transform 180ms ease-out, box-shadow 180ms ease-out,
+    background-color 180ms ease-out;
+}
+
+button.tile:hover,
+button.tile:active {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+button.tile:focus {
+  background-color: rgba(255, 255, 255, 0.20);
+  transform: translateY(-12px) scale(1.12);
+  box-shadow: 0 0 0 4px var(--accent-bg-color), 0 30px 60px rgba(0, 0, 0, 0.6);
+}
+
+button.tile:focus:active {
+  transform: translateY(-12px) scale(1.06);
+}

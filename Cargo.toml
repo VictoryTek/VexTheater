@@ -1,0 +1,27 @@
+[package]
+name = "vextheater"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["VictoryTek"]
+repository = "https://github.com/VictoryTek/VexTheater"
+description = "A full-screen TV launcher for GNOME"
+
+[dependencies]
+gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_6"] }
+glib = "0.20"
+gio = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+glib-build-tools = "0.20"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
