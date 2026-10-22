@@ -16,6 +16,11 @@
     rgba(0, 0, 0, 0.9) 0%, rgba(0, 0, 0, 0.6) 34%, rgba(0, 0, 0, 0) 62%);
 }
 
+/* Quiet enough to stay out of the way, like GNOME's background logo. */
+.vexos-logo {
+  opacity: 0.6;
+}
+
 .greeting {
   font-size: 44px;
   font-weight: 600;

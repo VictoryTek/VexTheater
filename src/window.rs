@@ -14,6 +14,7 @@ use std::time::Duration;
 
 const MAIN_PAGE: &str = "main";
 const ICON_SIZE: i32 = 96;
+const LOGO_WIDTH: i32 = 200;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
 const QUICK_FAILURE: Duration = Duration::from_secs(5);
 
@@ -204,6 +205,20 @@ impl Ui {
 
         let clock = Clock::new();
         overlay.add_overlay(&clock.widget);
+
+        // Bottom-right, clear of the tile row and the key hints, like GNOME's
+        // background logo.
+        let logo = gtk::Picture::for_resource("/io/github/vextheater/vexos-logo.png");
+        logo.add_css_class("vexos-logo");
+        logo.set_content_fit(gtk::ContentFit::Contain);
+        logo.set_can_shrink(true);
+        logo.set_size_request(LOGO_WIDTH, LOGO_WIDTH * 164 / 437);
+        logo.set_halign(gtk::Align::End);
+        logo.set_valign(gtk::Align::End);
+        logo.set_margin_end(96);
+        logo.set_margin_bottom(52);
+        logo.set_can_target(false);
+        overlay.add_overlay(&logo);
 
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&overlay));
