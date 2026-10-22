@@ -975,6 +975,7 @@ dependencies = [
  "glib-build-tools",
  "gtk4",
  "libadwaita",
+ "libc",
  "log",
  "serde",
  "serde_json",

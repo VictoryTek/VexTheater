@@ -4,6 +4,7 @@
 
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
+use crate::mode::{self, Mode};
 use crate::{gnome, launch};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -37,6 +38,16 @@ pub fn command_line(
             activate(application);
             0
         }
+        // What the autostart service runs: like no flag, but a launcher restarted
+        // after a crash in desktop mode stays in desktop mode.
+        [flag] if flag == "--resume" => {
+            if mode::saved() == Some(Mode::Desktop) {
+                ui(application);
+            } else {
+                activate(application);
+            }
+            0
+        }
         [flag] if flag == "--home" => {
             if let Some(ui) = ui(application) {
                 ui.home();
@@ -45,7 +56,9 @@ pub fn command_line(
         }
         _ => {
             command_line.printerr_literal(
-                "usage: vextheater [--home]\n  --home  close the open app and show the launcher\n",
+                "usage: vextheater [--home | --resume]\n  \
+                 --home    close the open app and show the launcher\n  \
+                 --resume  show the launcher, unless it crashed in desktop mode\n",
             );
             2
         }
@@ -204,6 +217,7 @@ impl Ui {
 
     /// Theater mode: the launcher full screen over the desktop.
     fn show(&self) {
+        mode::save(Mode::Theater);
         gnome::theater_mode();
         self.window.fullscreen();
         self.window.present();
@@ -217,7 +231,11 @@ impl Ui {
         self.show();
     }
 
+    /// Hides the launcher. A tile or home chosen during a close that is still running
+    /// is cancelled, so no app starts over the desktop once it finishes.
     fn desktop_mode(&self) {
+        self.pending.replace(None);
+        mode::save(Mode::Desktop);
         gnome::restore();
         self.window.set_visible(false);
     }
@@ -396,15 +414,19 @@ impl Ui {
     /// running only replaces the pending request, and the close acts on the latest
     /// one when it finishes. Nothing starts while a close runs, so it never races an
     /// app it should leave alone, and only it and `start` touch the Flatpak record.
+    ///
+    /// The close is handed the app started last, so it can close that app by its own
+    /// process even if the app has not registered with systemd or Flatpak yet.
     fn close_then(self: &Rc<Self>, request: Request) {
-        self.running.take();
         self.pending.replace(Some(request));
         if self.closing.replace(true) {
+            // Nothing has started since that close began, so `running` is empty.
             return;
         }
+        let launched = self.running.take();
         let ui = self.clone();
         glib::spawn_future_local(async move {
-            let closed = launch::stop_all().await;
+            let closed = launch::stop_all(launched).await;
             ui.closing.set(false);
             let request = ui.pending.take();
             match closed {
@@ -412,9 +434,18 @@ impl Ui {
                 Err(launch::StopError::Timeout) => ui
                     .toasts
                     .add_toast(adw::Toast::new("Couldn't close the previous app")),
-                Err(launch::StopError::Unknown) => {
+                Err(launch::StopError::GaveUp(apps)) => {
+                    log::warn!("giving up on {apps:?}: they will not close");
+                    ui.toasts.add_toast(adw::Toast::new(&format!(
+                        "{} won't close; giving up on it",
+                        apps.join(", ")
+                    )));
+                }
+                Err(launch::StopError::Unknown(launched)) => {
                     // The previous app may still be running: start nothing over it.
-                    // Choosing the tile again retries the close.
+                    // Choosing the tile again retries the close, still knowing the
+                    // app started last (`running` is empty while a close runs).
+                    ui.running.replace(launched);
                     ui.toasts.add_toast(adw::Toast::new(
                         "Couldn't check whether the previous app closed",
                     ));
@@ -432,11 +463,11 @@ impl Ui {
             Ok(running) => running,
             Err(error) => return self.failed(name, &error),
         };
-        let (ui, unit, name) = (self.clone(), running.unit.clone(), name.to_owned());
+        let (ui, launch_id, name) = (self.clone(), running.id.clone(), name.to_owned());
         running
             .process
             .wait_check_async(None::<&gio::Cancellable>, move |result| {
-                ui.app_exited(&unit, &name, result)
+                ui.app_exited(&launch_id, &name, result)
             });
         self.running.replace(Some(running));
     }
@@ -445,19 +476,24 @@ impl Ui {
     /// covers an app that leaves other windows behind. An app that fails within
     /// [`QUICK_FAILURE`] (not found, not installed) is reported. Apps the launcher
     /// closed itself are no longer in `running`, so they are not.
-    fn app_exited(&self, unit: &str, name: &str, result: Result<(), glib::Error>) {
+    fn app_exited(&self, launch_id: &str, name: &str, result: Result<(), glib::Error>) {
         let finished = {
             let mut running = self.running.borrow_mut();
             match running.as_ref() {
-                Some(r) if r.unit == unit => running.take(),
+                Some(r) if r.id == launch_id => running.take(),
                 _ => None,
             }
         };
         let Some(finished) = finished else {
             return;
         };
-        if let Err(error) = result {
-            if finished.started.elapsed() < QUICK_FAILURE {
+        if finished.started.elapsed() < QUICK_FAILURE {
+            // A Flatpak whose launched process is gone within moments while Flatpak
+            // still lists the app: log it, so a broken process-id assumption is seen.
+            if let Some(record) = finished.flatpak_app() {
+                glib::spawn_future_local(launch::check_early_exit(record));
+            }
+            if let Err(error) = result {
                 self.failed(name, &error.into());
             }
         }

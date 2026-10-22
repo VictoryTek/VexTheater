@@ -61,32 +61,79 @@ launcher uses a plain dark gradient.
 
 ## Behaviour
 
-- Each tile app runs in its own systemd user scope. Starting another tile closes the
-  previous app and waits for it to exit before starting the new one, so a second
-  Brave cannot hand its window to one that is shutting down. Only one close runs at a
-  time: tiles chosen (or home pressed) during a close replace each other, and only the
-  last one is acted on when the close finishes.
+- An ordinary tile app runs in its own systemd user scope; a Flatpak app is started
+  directly, because Flatpak moves it into a scope of its own, and the launcher records
+  that one instance (its process id and start time) in
+  `$XDG_RUNTIME_DIR/vextheater/flatpak-apps.json`. Closing an app never targets
+  others: a copy of the same Flatpak opened from the desktop is left alone.
+- Starting another tile closes the previous app and waits for it to exit before
+  starting the new one, so a second Brave cannot hand its window to one that is
+  shutting down. Only one close runs at a time: tiles chosen (or home pressed) during
+  a close replace each other, and only the last one is acted on when it finishes.
+  Choosing Desktop Mode cancels a pending tile.
+  `vextheater --home` closes the app and shows the launcher again (bind it to a key in
+  GNOME's keyboard shortcuts, or to a remote's Home button). Both close every
+  `vextheater-app-*` scope and recorded Flatpak instance, including apps left running
+  by a launcher that crashed.
+  - No process gets two SIGTERMs: Chromium-based apps like Brave start a clean
+    shutdown on the first and die on a second. An ordinary app is stopped through its
+    scope; the app started last is signalled directly only if its scope has not
+    registered yet, so a close that begins right after choosing a tile (home pressed
+    at once, a double Enter) still closes it. A Flatpak app's own process inside the
+    sandbox gets one SIGTERM, so Flatpak Chromium apps shut down cleanly too. That is
+    the sandbox's first process (`child-pid` in `flatpak ps`), or, when that is bwrap's
+    init, its children, or the init itself if it has none yet. While Flatpak has not
+    written the sandbox info yet (`child-pid` 0), the launcher-side process gets the
+    SIGTERM instead, which takes the sandbox with it. Signals are sent with `kill(2)`
+    directly, and never to pid 0 (the launcher's own process group), pid 1 or the
+    launcher itself.
   - Scopes get 5 s to exit; any still there are then killed, by name, and get up to
-    2 s more to disappear.
-  - A Flatpak app is closed with `flatpak kill` and waited for until a successful
-    `flatpak ps` no longer lists it, for up to 5 s of its own, alongside the scopes.
+    2 s more to disappear. A Flatpak instance gets 5 s after its SIGTERM, then
+    `flatpak kill` on that instance. A `systemctl stop` that fails is checked against a
+    fresh listing rather than taken as success.
   - If something is still running at the end, the launcher shows "Couldn't close the
-    previous app" and starts the next tile anyway.
+    previous app" and starts the next tile anyway. A Flatpak instance that did not
+    close stays recorded with a note that its SIGTERM was sent; every later close
+    (home or a tile) only waits for it and runs `flatpak kill` again, never a second
+    SIGTERM. After two failed `flatpak kill`s the launcher gives up on it, shows
+    "<app> won't close; giving up on it" and stops tracking it, so a stuck app does
+    not slow down every later close.
   - If the running scopes cannot be listed at all, whether an app is still running is
     unknown: the launcher shows "Couldn't check whether the previous app closed" and
     starts nothing. Choosing the tile again retries.
-  `vextheater --home` closes the app and shows the launcher again (bind this to a key
-  in GNOME's keyboard shortcuts, or to a remote's Home button). Both close every
-  `vextheater-app-*` scope, including apps left running by a launcher that crashed.
+  - A close takes at most about 20 s, and normally well under a second: up to 2 s to
+    list the scopes, then the slowest of the scopes (5 s to stop, 2 s to re-check a
+    failed stop, 2 s of kill grace and 2 s for its last check, 11 s), an app started
+    last whose scope registered during the close (5 s to exit, 2 s to kill, then the
+    same 11 s for its scope, 18 s) and a Flatpak instance (5 s to find it, 5 s to exit
+    after its SIGTERM, then `flatpak kill` and its effect share 2 s, 12 s).
+  - If a launched Flatpak's process exits within moments while `flatpak ps` still lists
+    the app, the launcher logs a warning (in the journal, as `vextheater`) that the
+    one-process-id assumption does not hold on this system.
 - Desktop mode hides the launcher; running `vextheater` again (e.g. "Theater Mode" in
   the app grid) shows it.
+- With `autostart`, the launcher runs as the `vextheater --resume` systemd user
+  service, part of the graphical session and restarted if it crashes. The current mode
+  is kept in `$XDG_RUNTIME_DIR/vextheater/mode`, so a launcher restarted after a crash
+  in desktop mode stays in desktop mode, and one that crashed in theater mode comes
+  back full screen. A clean exit removes the file, and a new login starts in theater
+  mode.
 - While the launcher is showing, GNOME's hot corner and notification banners are off.
   The values they had before are saved to `~/.local/state/vextheater/gnome-settings.json`
   and put back on desktop mode, quitting, closing the window (Alt+F4), SIGTERM and
   SIGINT. A launcher restarted after a crash keeps the saved file, so the original
-  values still come back.
+  values still come back. State files are written atomically: a temporary file, synced
+  and renamed over the old one, then the directory synced.
 - An app that exits with an error within 5 s of starting (not installed, command not
   found), or a refused shutdown or restart, shows "Couldn't open …".
+- A `desktop` tile's Exec line is parsed by the Desktop Entry spec's rules (quoted
+  arguments keep their spaces, `\"` `` \` `` `\$` `\` are unescaped inside double
+  quotes, `%%` is `%`, the file and URL field codes are dropped) and each argument is
+  quoted for `sh`.
+- An app that hands its window to an instance that is already running and then exits
+  (Nautilus when it is already open, or Brave left open in desktop mode) lives outside
+  the launcher's control: home cannot close it, and the launcher comes back in front
+  of it.
 
 ### Restoring GNOME settings by hand
 
@@ -109,22 +156,29 @@ rm -f ~/.local/state/vextheater/gnome-settings.json
   schemas through `XDG_DATA_DIRS`, and if `systemctl --user show-environment` shows it
   empty, the launcher quietly can't change GNOME settings.
 
-### Known limitations
+## Verify on the device
 
-- An app that hands its window to an instance that is already running and then exits
-  (Nautilus when it is already open, or Brave left open in desktop mode) lives outside
-  the launcher's scope: home cannot close it, and the launcher comes back in front of
-  it.
-- A `desktop` tile's Exec line has its whitespace collapsed when field codes are
-  removed, including runs of spaces inside quoted arguments (`sh -c "a  b"`).
-- The saved GNOME settings file is written atomically (temporary file, then rename),
-  but the directory is not synced afterwards, so a power cut right after the rename
-  may leave the previous file. A crash of the launcher itself cannot.
-- With `autostart`, the launcher runs as the `vextheater` systemd user service, part
-  of the graphical session and restarted if it crashes. A restarted launcher always
-  comes back full screen, even if it crashed while you were in desktop mode. That is
-  intended: on a TV, the launcher is the screen to recover to, and home or desktop
-  mode is one key away.
+These depend on the real desktop, so they can only be checked on the machine:
+
+- **Home from desktop mode.** In desktop mode, run `vextheater --home` from a GNOME
+  keyboard shortcut. GNOME 50 must bring the launcher to the front; if it only shows
+  a "VexTheater is ready" notification, the launcher cannot raise itself from there.
+- **GNOME settings reachable.** `systemctl --user show-environment | grep XDG_DATA_DIRS`
+  must not be empty (see Troubleshooting above).
+- **Flatpak keeps one process id.** The launcher closes a Flatpak app through the
+  process it started, which assumes `flatpak run` execs into the sandbox's wrapper
+  with the same process id. With FreeTube installed:
+
+  ```sh
+  flatpak run io.freetubeapp.FreeTube & p=$!; sleep 8
+  echo "launched PID $p is: $(ps -o comm= -p $p)"
+  flatpak ps --columns=instance,pid,child-pid,application | grep -i freetube
+  kill $p; sleep 3; flatpak ps --columns=application | grep -qi freetube \
+    && echo "STILL RUNNING" || echo "closed by one SIGTERM"
+  ```
+
+  It holds if the launched PID shows as `bwrap`, matches the `pid` column of the
+  `flatpak ps` line, and the last line prints "closed by one SIGTERM".
 
 ## Development
 

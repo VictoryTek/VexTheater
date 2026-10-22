@@ -14,7 +14,7 @@ On a Windows checkout, run these through WSL (`wsl -e bash -lc 'cd /mnt/c/Projec
 
 ## Repository
 
-- `src/` — `main.rs` (GApplication), `config.rs` (JSON schema + validation), `window.rs` (launcher UI: pages, tiles, navigation, pointer hiding; theater/desktop mode; `--home`), `clock.rs` (time, date, greeting), `launch.rs` (systemd scopes, Flatpak, power), `gnome.rs` (hot corner / banner settings)
+- `src/` — `main.rs` (GApplication), `config.rs` (JSON schema + validation), `window.rs` (launcher UI: pages, tiles, navigation, pointer hiding; theater/desktop mode; `--home`), `clock.rs` (time, date, greeting), `launch.rs` (start/close lifecycle: scopes, recorded Flatpak instances, Exec parsing, power), `gnome.rs` (hot corner / banner settings), `mode.rs` (theater/desktop mode kept across crashes), `files.rs` (atomic state-file writes)
 - `data/` — desktop file, AppStream metainfo, icon, `style.css`, gresource manifest (compiled by `build.rs`)
 - `nix/` — `package.nix` (rustPlatform.buildRustPackage), `module.nix` (`programs.vextheater`: install, `autostart` as a systemd user service in graphical-session.target, `settings` → `/etc/vextheater/config.json`)
 - Consumer: vexos-nix `modules/htpc-theater.nix` builds `settings` from `vexos.htpc.theater.apps` and binds the home key. The JSON schema in `config.rs` (documented in README.md) is a contract with that module: change both together.

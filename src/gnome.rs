@@ -9,7 +9,6 @@
 
 use gio::prelude::*;
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const KEYS: [(&str, &str); 2] = [
@@ -81,30 +80,8 @@ fn state_file() -> PathBuf {
 }
 
 fn save(path: &Path, values: &Values) -> anyhow::Result<()> {
-    let text = serde_json::to_string(values)?;
-    write_file(path, text.as_bytes(), |file, bytes| file.write_all(bytes))?;
+    crate::files::write_atomic(path, serde_json::to_string(values)?.as_bytes())?;
     Ok(())
-}
-
-/// Writes `bytes` to a temporary file beside `path` through `write` (which tests
-/// replace to simulate a crash part way through), then renames it over `path`. A
-/// crash before the rename leaves the previous file as it was.
-fn write_file(
-    path: &Path,
-    bytes: &[u8],
-    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-
-    let mut file = std::fs::File::create(&temporary)?;
-    write(&mut file, bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)
 }
 
 /// Reads and removes the saved values. An unreadable file is removed too, so it
@@ -141,20 +118,6 @@ mod tests {
         assert_eq!(take(&path), Some(values));
         assert!(!path.exists(), "restoring must remove the file");
         assert_eq!(take(&path), None);
-    }
-
-    #[test]
-    fn an_interrupted_write_leaves_the_previous_file_intact() {
-        let path = scratch("interrupted.json");
-        std::fs::write(&path, "previous").unwrap();
-
-        let crash_half_way = |file: &mut std::fs::File, bytes: &[u8]| {
-            file.write_all(&bytes[..bytes.len() / 2])?;
-            Err(std::io::Error::other("simulated crash"))
-        };
-        assert!(write_file(&path, b"replacement", crash_half_way).is_err());
-
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous");
     }
 
     #[test]

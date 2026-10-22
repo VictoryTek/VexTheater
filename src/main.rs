@@ -2,18 +2,16 @@
 
 mod clock;
 mod config;
+mod files;
 mod gnome;
 mod launch;
+mod mode;
 mod window;
 
 use adw::prelude::*;
 
 /// Also the gresource prefix.
 pub const APP_ID: &str = "io.github.vextheater";
-
-// Linux signal numbers, for glib::unix_signal_add_local.
-const SIGINT: i32 = 2;
-const SIGTERM: i32 = 15;
 
 fn main() -> glib::ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -39,8 +37,11 @@ fn main() -> glib::ExitCode {
 
     // Every way out ends here: quitting, closing the last window (Alt+F4), and the
     // signals below, which systemd sends when the session ends.
-    application.connect_shutdown(|_| gnome::restore());
-    for signal in [SIGINT, SIGTERM] {
+    application.connect_shutdown(|_| {
+        gnome::restore();
+        mode::clear();
+    });
+    for signal in [libc::SIGINT, libc::SIGTERM] {
         let application = application.clone();
         glib::unix_signal_add_local(signal, move || {
             application.quit();

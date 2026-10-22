@@ -62,7 +62,8 @@ in
       # on PATH, so keep the session's PATH instead of NixOS's minimal service one.
       enableDefaultPath = false;
       serviceConfig = {
-        ExecStart = lib.getExe cfg.package;
+        # --resume: after a crash in desktop mode, come back in desktop mode.
+        ExecStart = "${lib.getExe cfg.package} --resume";
         Restart = "on-failure";
         RestartSec = 2;
       };
