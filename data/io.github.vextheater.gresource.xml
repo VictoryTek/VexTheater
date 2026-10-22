@@ -2,6 +2,6 @@
 <gresources>
   <gresource prefix="/io/github/vextheater">
     <file alias="style.css">style.css</file>
-    <file alias="icons/hicolor/scalable/apps/io.github.vextheater.svg">icons/hicolor/scalable/apps/io.github.vextheater.svg</file>
+    <file alias="icons/hicolor/512x512/apps/io.github.vextheater.png">icons/hicolor/512x512/apps/io.github.vextheater.png</file>
   </gresource>
 </gresources>

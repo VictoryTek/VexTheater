@@ -42,8 +42,8 @@ rustPlatform.buildRustPackage {
       $out/share/applications/io.github.vextheater.desktop
     install -Dm644 data/io.github.vextheater.metainfo.xml \
       $out/share/metainfo/io.github.vextheater.metainfo.xml
-    install -Dm644 data/icons/hicolor/scalable/apps/io.github.vextheater.svg \
-      $out/share/icons/hicolor/scalable/apps/io.github.vextheater.svg
+    install -Dm644 data/icons/hicolor/512x512/apps/io.github.vextheater.png \
+      $out/share/icons/hicolor/512x512/apps/io.github.vextheater.png
     gtk4-update-icon-cache -qtf $out/share/icons/hicolor
   '';
 
