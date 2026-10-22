@@ -13,7 +13,8 @@ use gio::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Matches the scope of every app any launcher instance started.
@@ -27,6 +28,33 @@ const POLL: Duration = Duration::from_millis(200);
 const MAX_KILL_ATTEMPTS: u32 = 2;
 /// How long [`check_early_exit`] waits for an app to show up in `flatpak ps`.
 const EARLY_EXIT_WATCH: Duration = Duration::from_secs(3);
+
+/// The timings, helper programs and record file the lifecycle uses. The default is the
+/// real set; the tests give it millisecond timings and stub programs, so the whole
+/// start and close lifecycle runs against real processes without Flatpak or systemd.
+#[derive(Clone)]
+struct Env {
+    stop_timeout: Duration,
+    kill_grace: Duration,
+    poll: Duration,
+    flatpak: String,
+    systemctl: String,
+    /// Where the running Flatpak instances are recorded.
+    records: PathBuf,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Env {
+            stop_timeout: STOP_TIMEOUT,
+            kill_grace: KILL_GRACE,
+            poll: POLL,
+            flatpak: "flatpak".into(),
+            systemctl: "systemctl".into(),
+            records: flatpaks_file(),
+        }
+    }
+}
 
 /// An app started from a tile.
 pub struct Running {
@@ -130,9 +158,10 @@ fn start_flatpak(app: &str, command: &str) -> anyhow::Result<Running> {
         });
     match &record {
         Some(record) => {
-            let mut apps = load_flatpaks();
+            let records = flatpaks_file();
+            let mut apps = load_flatpaks(&records);
             apps.push(record.clone());
-            save_flatpaks(&apps);
+            save_flatpaks(&records, &apps);
         }
         // Practically unreachable: the child was just spawned and is not reaped until
         // the main loop runs, so /proc/<pid>/stat exists (at worst as a zombie). If it
@@ -190,25 +219,29 @@ pub enum StopError {
 ///   `flatpak kill` and its effect share 2 s: 12 s. Signals are system calls and take
 ///   no time.
 pub async fn stop_all(launched: Option<Running>) -> Result<(), StopError> {
+    stop_all_with(launched, Rc::new(Env::default())).await
+}
+
+async fn stop_all_with(launched: Option<Running>, env: Rc<Env>) -> Result<(), StopError> {
     // The launcher starts nothing while a close is running, so these are all the apps
     // there are, apart from a launched app that has not registered yet.
-    let Some(scopes) = running_scopes().await else {
+    let Some(scopes) = running_scopes(&env).await else {
         log::error!("cannot list the app scopes; not starting anything over them");
         return Err(StopError::Unknown(launched));
     };
 
-    let mut flatpaks = load_flatpaks();
+    let mut flatpaks = load_flatpaks(&env.records);
     if let Some(record) = launched.as_ref().and_then(|l| l.flatpak.clone()) {
         if !flatpaks.iter().any(|saved| saved.same_process(&record)) {
             flatpaks.push(record);
         }
     }
 
-    let context = glib::MainContext::default();
+    let context = glib::MainContext::ref_thread_default();
     let flatpak_tasks: Vec<_> = flatpaks
         .into_iter()
         .map(|record| {
-            let task = context.spawn_local(stop_flatpak(record.clone()));
+            let task = context.spawn_local(stop_flatpak(record.clone(), env.clone()));
             (record, task)
         })
         .collect();
@@ -219,12 +252,13 @@ pub async fn stop_all(launched: Option<Running>) -> Result<(), StopError> {
         .map(|launched| {
             let scope = launched.scope.clone();
             let registered = scope.as_ref().is_some_and(|scope| scopes.contains(scope));
+            let env = env.clone();
             context.spawn_local(async move {
-                stop_process(&launched, scope.as_deref(), registered).await
+                stop_process(&launched, scope.as_deref(), registered, &env).await
             })
         });
 
-    let mut closed = stop_scopes(&scopes).await;
+    let mut closed = stop_scopes(&scopes, &env).await;
     if let Some(task) = launched_task {
         closed &= task.await.unwrap_or(false);
     }
@@ -238,7 +272,7 @@ pub async fn stop_all(launched: Option<Running>) -> Result<(), StopError> {
             Err(_) => still_running.push(original),
         }
     }
-    save_flatpaks(&still_running);
+    save_flatpaks(&env.records, &still_running);
 
     if !gave_up.is_empty() {
         Err(StopError::GaveUp(gave_up))
@@ -254,25 +288,31 @@ pub async fn stop_all(launched: Option<Running>) -> Result<(), StopError> {
 /// sends the SIGTERM. Otherwise the app gets its SIGTERM here, and its scope, should it
 /// have registered meanwhile, is stopped once that process is gone, with the same budget
 /// and check as the others, so nothing in it is signalled twice.
-async fn stop_process(launched: &Running, scope: Option<&str>, registered: bool) -> bool {
+async fn stop_process(
+    launched: &Running,
+    scope: Option<&str>,
+    registered: bool,
+    env: &Env,
+) -> bool {
     if scope.is_none() || !registered {
         launched.process.send_signal(libc::SIGTERM);
     }
-    let mut exited = glib::future_with_timeout(STOP_TIMEOUT, launched.process.wait_future())
+    let mut exited = glib::future_with_timeout(env.stop_timeout, launched.process.wait_future())
         .await
         .is_ok();
     if !exited {
         log::warn!(
-            "{} still running after {STOP_TIMEOUT:?}; killing it",
-            launched.id
+            "{} still running after {:?}; killing it",
+            launched.id,
+            env.stop_timeout
         );
         launched.process.force_exit();
-        exited = glib::future_with_timeout(KILL_GRACE, launched.process.wait_future())
+        exited = glib::future_with_timeout(env.kill_grace, launched.process.wait_future())
             .await
             .is_ok();
     }
     match scope {
-        Some(scope) if exited && !registered => stop_scopes(&[scope.to_owned()]).await,
+        Some(scope) if exited && !registered => stop_scopes(&[scope.to_owned()], env).await,
         _ => exited,
     }
 }
@@ -288,60 +328,72 @@ enum FlatpakOutcome {
 
 /// Closes one recorded Flatpak instance: one SIGTERM, ever, to the app inside the
 /// sandbox so it can shut down cleanly, and `flatpak kill` on that instance if it is
-/// still there afterwards. An instance not listed yet, or listed before its sandbox
-/// info exists (`child-pid` 0), has the launcher-side process signalled instead, which
-/// takes the sandbox down with it. The record is returned with what was done to it.
-async fn stop_flatpak(mut record: FlatpakApp) -> (FlatpakApp, FlatpakOutcome) {
-    if !record.alive() {
-        return (record, FlatpakOutcome::Closed);
-    }
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let instance = loop {
-        if let Some(instances) = flatpak_instances(deadline).await {
-            break Some(instances.into_iter().find(|i| record.owns(i)));
+/// still there afterwards.
+///
+/// Nothing is signalled until the instance is listed with its sandbox info (`child-pid`
+/// not 0), which can take a moment after the launch: signalling the launcher-side
+/// process earlier takes the sandbox down with it, so the app never shuts down cleanly.
+/// If that has not happened after the stop timeout (`flatpak ps` failing, the instance
+/// never listed or never ready), the recorded process gets the one SIGTERM instead, and
+/// a SIGKILL after another timeout. The record is returned with what was done to it.
+async fn stop_flatpak(mut record: FlatpakApp, env: Rc<Env>) -> (FlatpakApp, FlatpakOutcome) {
+    let deadline = Instant::now() + env.stop_timeout;
+    let ready = loop {
+        if !record.alive() {
+            return (record, FlatpakOutcome::Closed);
+        }
+        let listed = flatpak_instances(&env, deadline).await;
+        let answered = listed.is_some();
+        let ours = listed.and_then(|all| all.into_iter().find(|i| record.owns(i)));
+        if let Some(targets) = ours.as_ref().and_then(Instance::term_targets) {
+            break ours.map(|instance| (instance, targets));
+        }
+        // A record an earlier close already SIGTERMed has no SIGTERM left to wait for,
+        // so one listing is enough. Here the instance is unlisted or not ready, and
+        // `flatpak kill` cannot reach either: the recorded process gets the SIGKILL.
+        if record.termed && answered {
+            break None;
         }
         if Instant::now() >= deadline {
             break None;
         }
-        glib::timeout_future(POLL).await;
+        glib::timeout_future(env.poll).await;
     };
 
     if !record.termed {
-        match &instance {
-            Some(Some(instance)) => match instance.term_targets() {
-                Some(targets) => {
-                    for pid in targets {
-                        send_signal(pid, libc::SIGTERM);
-                    }
+        match &ready {
+            Some((_, targets)) => {
+                for &pid in targets {
+                    send_signal(pid, libc::SIGTERM);
                 }
-                None => {
-                    send_signal(record.pid, libc::SIGTERM);
-                }
-            },
-            Some(None) => {
-                send_signal(record.pid, libc::SIGTERM);
             }
-            // flatpak ps never answered: the app inside is unknown, so no clean stop.
-            None => log::warn!("cannot list Flatpak instances to stop {}", record.app),
+            None => {
+                log::warn!(
+                    "no ready Flatpak instance of {} after {:?}; signalling its process",
+                    record.app,
+                    env.stop_timeout
+                );
+                record.signal(libc::SIGTERM);
+            }
         }
-        record.termed = instance.is_some();
+        record.termed = true;
     }
-    if record.termed && wait_until_gone(&record, Instant::now() + STOP_TIMEOUT).await {
+    if wait_until_gone(&record, Instant::now() + env.stop_timeout, &env).await {
         return (record, FlatpakOutcome::Closed);
     }
 
     log::warn!("{} still running; killing it", record.app);
     record.kill_attempts += 1;
-    let grace = Instant::now() + KILL_GRACE;
-    match instance {
-        Some(Some(instance)) => {
-            run(&["flatpak", "kill", &instance.instance], grace).await;
+    let grace = Instant::now() + env.kill_grace;
+    match ready {
+        Some((instance, _)) => {
+            run(&[&env.flatpak, "kill", &instance.instance], grace).await;
         }
-        _ => {
-            send_signal(record.pid, libc::SIGKILL);
+        None => {
+            record.signal(libc::SIGKILL);
         }
     }
-    if wait_until_gone(&record, grace).await {
+    if wait_until_gone(&record, grace, &env).await {
         (record, FlatpakOutcome::Closed)
     } else if record.kill_attempts >= MAX_KILL_ATTEMPTS {
         log::warn!(
@@ -355,7 +407,7 @@ async fn stop_flatpak(mut record: FlatpakApp) -> (FlatpakApp, FlatpakOutcome) {
     }
 }
 
-async fn wait_until_gone(record: &FlatpakApp, deadline: Instant) -> bool {
+async fn wait_until_gone(record: &FlatpakApp, deadline: Instant, env: &Env) -> bool {
     loop {
         if !record.alive() {
             return true;
@@ -363,7 +415,7 @@ async fn wait_until_gone(record: &FlatpakApp, deadline: Instant) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
-        glib::timeout_future(POLL).await;
+        glib::timeout_future(env.poll).await;
     }
 }
 
@@ -395,6 +447,20 @@ impl FlatpakApp {
         proc_stat(self.pid).is_some_and(|stat| {
             stat.start_time == self.start_time && !matches!(stat.state, 'Z' | 'X')
         })
+    }
+
+    /// Sends `signal` to this process if it is still the recorded one, checked right
+    /// before sending, so a pid that was reused meanwhile is never signalled.
+    fn signal(&self, signal: i32) -> bool {
+        self.alive() && send_signal(self.pid, signal)
+    }
+
+    /// Whether an instance whose wrapper process started at `started` (clock ticks, as
+    /// in [`ProcStat`]; None if it is gone) can have come from this launch, that is, did
+    /// not start before it. An older instance of the same app, stuck from before or
+    /// opened from the desktop, is not this launch's.
+    fn could_come_from(&self, started: Option<u64>) -> bool {
+        started.is_some_and(|started| started >= self.start_time)
     }
 
     /// Whether `instance` is this app's: Flatpak's wrapper is this process, or (should
@@ -466,33 +532,44 @@ fn term_targets(child_pid: u32, is_init: bool, children: &[u32]) -> Option<Vec<u
 /// The app may take a moment to appear in `flatpak ps`, so this watches for
 /// [`EARLY_EXIT_WATCH`] rather than looking once.
 pub async fn check_early_exit(record: FlatpakApp) {
-    let deadline = Instant::now() + EARLY_EXIT_WATCH;
+    if early_exit(&record, &Env::default(), EARLY_EXIT_WATCH).await {
+        log::warn!(
+            "the {} process the launcher started has exited, but Flatpak still lists \
+             the app: the assumption that `flatpak run` keeps one process id does not \
+             hold on this system, so the launcher cannot close this app",
+            record.app
+        );
+    }
+}
+
+/// Whether, within `watch`, `flatpak ps` lists an instance of the app that is not the
+/// launched process but started no earlier than it, as if this launch were still
+/// running although its process is gone. Older instances of the app are not this
+/// launch's and are ignored.
+async fn early_exit(record: &FlatpakApp, env: &Env, watch: Duration) -> bool {
+    let deadline = Instant::now() + watch;
     loop {
-        let listed = flatpak_instances(Instant::now() + KILL_GRACE).await;
+        let listed = flatpak_instances(env, Instant::now() + env.kill_grace).await;
         if listed.is_some_and(|instances| {
-            instances
-                .iter()
-                .any(|i| i.app == record.app && !record.owns(i))
+            instances.iter().any(|i| {
+                i.app == record.app
+                    && !record.owns(i)
+                    && record.could_come_from(proc_stat(i.pid).map(|stat| stat.start_time))
+            })
         }) {
-            log::warn!(
-                "the {} process the launcher started has exited, but Flatpak still lists \
-                 the app: the assumption that `flatpak run` keeps one process id does not \
-                 hold on this system, so the launcher cannot close this app",
-                record.app
-            );
-            return;
+            return true;
         }
         if Instant::now() >= deadline {
-            return;
+            return false;
         }
-        glib::timeout_future(POLL).await;
+        glib::timeout_future(env.poll).await;
     }
 }
 
 /// The running Flatpak instances; None if `flatpak ps` failed.
-async fn flatpak_instances(deadline: Instant) -> Option<Vec<Instance>> {
+async fn flatpak_instances(env: &Env, deadline: Instant) -> Option<Vec<Instance>> {
     let ps = [
-        "flatpak",
+        env.flatpak.as_str(),
         "ps",
         "--columns=instance,pid,child-pid,application",
     ];
@@ -559,17 +636,17 @@ fn flatpaks_file() -> PathBuf {
         .join("flatpak-apps.json")
 }
 
-fn load_flatpaks() -> Vec<FlatpakApp> {
-    std::fs::read_to_string(flatpaks_file())
+fn load_flatpaks(file: &Path) -> Vec<FlatpakApp> {
+    std::fs::read_to_string(file)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
 
-fn save_flatpaks(apps: &[FlatpakApp]) {
+fn save_flatpaks(file: &Path, apps: &[FlatpakApp]) {
     let written = serde_json::to_vec(apps)
         .map_err(std::io::Error::other)
-        .and_then(|json| crate::files::write_atomic(&flatpaks_file(), &json));
+        .and_then(|json| crate::files::write_atomic(file, &json));
     if let Err(error) = written {
         log::error!("cannot record the running Flatpak apps: {error}");
     }
@@ -577,13 +654,13 @@ fn save_flatpaks(apps: &[FlatpakApp]) {
 
 /// `systemctl stop` returns once the scopes are gone. At the time limit the ones still
 /// there are killed, by name, so nothing started since the snapshot is touched.
-async fn stop_scopes(scopes: &[String]) -> bool {
+async fn stop_scopes(scopes: &[String], env: &Env) -> bool {
     if scopes.is_empty() {
         return true;
     }
-    let deadline = Instant::now() + STOP_TIMEOUT;
+    let deadline = Instant::now() + env.stop_timeout;
     let names = scopes.iter().map(String::as_str);
-    let stop: Vec<&str> = ["systemctl", "--user", "stop"]
+    let stop: Vec<&str> = [env.systemctl.as_str(), "--user", "stop"]
         .into_iter()
         .chain(names.clone())
         .collect();
@@ -592,7 +669,7 @@ async fn stop_scopes(scopes: &[String]) -> bool {
         // Non-zero also when a scope vanished on its own or was never registered;
         // only a listing shows whether any are actually left.
         Some(Output { success: false, .. }) => {
-            if running_scopes()
+            if running_scopes(env)
                 .await
                 .is_some_and(|left| !scopes.iter().any(|scope| left.contains(scope)))
             {
@@ -600,18 +677,21 @@ async fn stop_scopes(scopes: &[String]) -> bool {
             }
             log::warn!("systemctl stop failed for {scopes:?}; killing them");
         }
-        None => log::warn!("{scopes:?} still running after {STOP_TIMEOUT:?}; killing them"),
+        None => log::warn!(
+            "{scopes:?} still running after {:?}; killing them",
+            env.stop_timeout
+        ),
     }
 
-    let grace = Instant::now() + KILL_GRACE;
-    let kill: Vec<&str> = ["systemctl", "--user", "kill", "--signal=SIGKILL"]
+    let grace = Instant::now() + env.kill_grace;
+    let kill: Vec<&str> = [env.systemctl.as_str(), "--user", "kill", "--signal=SIGKILL"]
         .into_iter()
         .chain(names)
         .collect();
     run(&kill, grace).await;
     loop {
         // A listing that fails says nothing; keep polling until the grace ends.
-        if let Some(left) = running_scopes().await {
+        if let Some(left) = running_scopes(env).await {
             if !scopes.iter().any(|scope| left.contains(scope)) {
                 return true;
             }
@@ -620,14 +700,14 @@ async fn stop_scopes(scopes: &[String]) -> bool {
             log::warn!("{scopes:?} still there after SIGKILL");
             return false;
         }
-        glib::timeout_future(POLL).await;
+        glib::timeout_future(env.poll).await;
     }
 }
 
 /// Names of the loaded `vextheater-app-*` scopes; None if they could not be listed.
-async fn running_scopes() -> Option<Vec<String>> {
+async fn running_scopes(env: &Env) -> Option<Vec<String>> {
     let list = [
-        "systemctl",
+        env.systemctl.as_str(),
         "--user",
         "list-units",
         "--type=scope",
@@ -635,7 +715,7 @@ async fn running_scopes() -> Option<Vec<String>> {
         "--plain",
         ALL_SCOPES,
     ];
-    match run(&list, Instant::now() + KILL_GRACE).await {
+    match run(&list, Instant::now() + env.kill_grace).await {
         Some(Output {
             stdout,
             success: true,
@@ -903,6 +983,21 @@ mod tests {
     }
 
     #[test]
+    fn only_an_instance_that_started_no_earlier_can_come_from_the_launch() {
+        let launch = FlatpakApp {
+            app: "x".into(),
+            pid: 10,
+            start_time: 500,
+            termed: false,
+            kill_attempts: 0,
+        };
+        assert!(launch.could_come_from(Some(500)));
+        assert!(launch.could_come_from(Some(501)));
+        assert!(!launch.could_come_from(Some(499)));
+        assert!(!launch.could_come_from(None));
+    }
+
+    #[test]
     fn splits_exec_lines_by_the_spec() {
         assert_eq!(exec_argv("firefox %u").unwrap(), ["firefox"]);
         assert_eq!(exec_argv("app %F --flag").unwrap(), ["app", "--flag"]);
@@ -964,5 +1059,518 @@ mod exec_tests {
     #[test]
     fn rejects_an_unterminated_quote() {
         assert!(desktop_command(r#"app "unterminated"#).is_err());
+    }
+}
+
+/// The start and close lifecycle, end to end: real processes, a stub `flatpak` and a
+/// stub `systemctl` in a scratch directory, and millisecond timings.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    const APP: &str = "org.example.App";
+
+    /// One script behind both stubs; it acts as the program it is invoked as and keeps
+    /// its answers and logs in its own directory, which tests fill in.
+    const STUB: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+case "$(basename "$0")" in
+flatpak)
+  case "$1" in
+  ps) [ -e "$d/ps_fail" ] && exit 1; [ -e "$d/ps.txt" ] && cat "$d/ps.txt"; exit 0 ;;
+  kill) echo "$2" >> "$d/flatpak-kill.log"; exit 0 ;;
+  esac ;;
+systemctl)
+  echo "$*" >> "$d/systemctl.log"
+  case "$2" in
+  list-units) [ -e "$d/list_fail" ] && exit 1; [ -e "$d/units.txt" ] && cat "$d/units.txt"; exit 0 ;;
+  stop) [ -e "$d/stop_term_pid" ] && kill -TERM "$(cat "$d/stop_term_pid")" 2>/dev/null; exit 0 ;;
+  kill) exit 0 ;;
+  esac ;;
+esac
+exit 1
+"#;
+
+    /// Shuts down on SIGTERM, logging it.
+    const POLITE: &str = r#"trap 'echo term >> "$1"; exit 0' TERM
+touch "$1.ready"; while :; do sleep 0.05; done"#;
+    /// Logs SIGTERM and carries on; only SIGKILL stops it.
+    const STUBBORN: &str = r#"trap 'echo term >> "$1"' TERM
+touch "$1.ready"; while :; do sleep 0.05; done"#;
+    /// Chromium-like: the first SIGTERM starts a clean shutdown that takes `$2` ticks of
+    /// 50 ms; a second one kills it on the spot, losing its session.
+    const CHROMIUM: &str = r#"n=0; stopping=0; i=0
+trap 'n=$((n+1)); echo term >> "$1"; if [ $n -ge 2 ]; then echo died >> "$1"; exit 1; fi; stopping=1' TERM
+touch "$1.ready"
+while :; do
+  sleep 0.05
+  if [ $stopping = 1 ]; then i=$((i+1)); if [ $i -ge $2 ]; then echo clean >> "$1"; exit 0; fi; fi
+done"#;
+    /// Stands in for Flatpak's wrapper: runs while process `$1` does.
+    const WATCHER: &str = r#"while [ -r /proc/$1/stat ]; do sleep 0.05; done"#;
+
+    fn stub_script() -> &'static Path {
+        static STUBS: OnceLock<PathBuf> = OnceLock::new();
+        STUBS.get_or_init(|| {
+            // Written once, before any test forks a helper, so it is never executed
+            // while another thread's child still holds it open for writing.
+            let dir = std::env::temp_dir().join(format!("vextheater-stub-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("stub.sh");
+            std::fs::write(&script, STUB).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        })
+    }
+
+    /// Runs `future` on a main context of its own, so tests can run in parallel.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| context.block_on(future))
+            .unwrap()
+    }
+
+    /// A scratch directory with the stubs in it. Processes started through it are
+    /// killed when it is dropped.
+    struct Lab {
+        dir: PathBuf,
+        pids: RefCell<Vec<u32>>,
+    }
+
+    impl Lab {
+        fn new() -> Lab {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let script = stub_script();
+            let dir = script
+                .parent()
+                .unwrap()
+                .join(format!("lab-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["flatpak", "systemctl"] {
+                symlink(script, dir.join(name)).unwrap();
+            }
+            Lab {
+                dir,
+                pids: RefCell::default(),
+            }
+        }
+
+        /// Timings in milliseconds: `stop` is the stop timeout.
+        fn env(&self, stop: u64) -> Rc<Env> {
+            Rc::new(Env {
+                stop_timeout: Duration::from_millis(stop),
+                kill_grace: Duration::from_millis(1000),
+                poll: Duration::from_millis(20),
+                flatpak: self.dir.join("flatpak").to_string_lossy().into_owned(),
+                systemctl: self.dir.join("systemctl").to_string_lossy().into_owned(),
+                records: self.dir.join("records.json"),
+            })
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        /// What the script named `log` wrote to its log, one word per line.
+        fn log(&self, log: &str) -> String {
+            std::fs::read_to_string(self.path(log)).unwrap_or_default()
+        }
+
+        fn write(&self, name: &str, text: &str) {
+            write_replacing(&self.path(name), text);
+        }
+
+        /// Writes `text` to `name` after `ms` milliseconds.
+        fn write_later(&self, ms: u64, name: &str, text: String) {
+            let path = self.path(name);
+            glib::spawn_future_local(async move {
+                glib::timeout_future(Duration::from_millis(ms)).await;
+                write_replacing(&path, &text);
+            });
+        }
+
+        /// Starts `script` as a plain child, returning once it has installed its signal
+        /// handlers.
+        fn spawn(&self, script: &str, log: &str, args: &[&str]) -> u32 {
+            let log_path = self.path(log);
+            let child = Command::new("sh")
+                .args(["-c", script, "stub"])
+                .arg(&log_path)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            self.pids.borrow_mut().push(pid);
+            // Reaped as soon as it exits, as init would, so it is gone for `kill -0`.
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+            wait_for(&self.path(&format!("{log}.ready")));
+            pid
+        }
+
+        /// Starts `script` the way the launcher starts an app: a `gio::Subprocess`.
+        fn process(&self, script: &str, args: &[&str]) -> gio::Subprocess {
+            let mut argv = vec!["sh".to_owned(), "-c".into(), script.into(), "stub".into()];
+            argv.extend(args.iter().map(|arg| arg.to_string()));
+            let argv: Vec<&OsStr> = argv.iter().map(OsStr::new).collect();
+            let process = gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE).unwrap();
+            self.pids.borrow_mut().push(pid_of(&process));
+            process
+        }
+
+        /// A launched Flatpak app, recorded as `start_flatpak` records it.
+        fn launched_flatpak(&self, script: &str, args: &[&str]) -> Running {
+            let process = self.process(script, args);
+            let pid = pid_of(&process);
+            Running {
+                id: "vextheater-app-test".into(),
+                scope: None,
+                flatpak: Some(FlatpakApp {
+                    app: APP.into(),
+                    pid,
+                    start_time: proc_stat(pid).unwrap().start_time,
+                    termed: false,
+                    kill_attempts: 0,
+                }),
+                process,
+                started: Instant::now(),
+            }
+        }
+
+        /// A launched ordinary app in the scope `scope`.
+        fn launched_scoped(&self, scope: &str, script: &str, log: &str) -> Running {
+            let log_path = self.path(log);
+            let process = self.process(script, &[log_path.to_str().unwrap()]);
+            wait_for(&self.path(&format!("{log}.ready")));
+            Running {
+                id: "vextheater-app-test".into(),
+                scope: Some(scope.into()),
+                flatpak: None,
+                process,
+                started: Instant::now(),
+            }
+        }
+    }
+
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            for pid in self.pids.borrow().iter() {
+                // SAFETY: a test helper that was started by this lab; at worst it is gone.
+                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn pid_of(process: &gio::Subprocess) -> u32 {
+        process.identifier().unwrap().parse().unwrap()
+    }
+
+    fn write_replacing(path: &Path, text: &str) {
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, text).unwrap();
+        std::fs::rename(temp, path).unwrap();
+    }
+
+    fn wait_for(path: &Path) {
+        for _ in 0..300 {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    /// A `flatpak ps` line: this wrapper process and sandbox first process.
+    fn listing(wrapper: u32, child: u32) -> String {
+        format!("1234567 {wrapper} {child} {APP}\n")
+    }
+
+    fn pid_gone(pid: u32) -> bool {
+        proc_stat(pid).is_none_or(|stat| matches!(stat.state, 'Z' | 'X'))
+    }
+
+    // Item 1: signalling the launcher-side process before the instance is listed takes
+    // the sandbox down with it, so the app never shuts down cleanly.
+    #[test]
+    fn an_instance_not_listed_yet_is_waited_for_not_signalled() {
+        let lab = Lab::new();
+        let sandbox = lab.spawn(POLITE, "sandbox.log", &[]);
+        let app = lab.launched_flatpak(WATCHER, &[&sandbox.to_string()]);
+        let wrapper = app.flatpak.as_ref().unwrap().pid;
+        let env = lab.env(3000);
+        let result = block_on(async {
+            lab.write_later(250, "ps.txt", listing(wrapper, sandbox));
+            stop_all_with(Some(app), env).await
+        });
+        assert!(result.is_ok());
+        assert_eq!(lab.log("sandbox.log"), "term\n");
+        assert!(!lab.path("flatpak-kill.log").exists());
+    }
+
+    // Item 3: an instance listed with child-pid 0 is not ready, not a failed kill.
+    #[test]
+    fn a_not_ready_instance_is_waited_for_not_signalled() {
+        let lab = Lab::new();
+        let sandbox = lab.spawn(POLITE, "sandbox.log", &[]);
+        let app = lab.launched_flatpak(WATCHER, &[&sandbox.to_string()]);
+        let wrapper = app.flatpak.as_ref().unwrap().pid;
+        lab.write("ps.txt", &listing(wrapper, 0));
+        let env = lab.env(3000);
+        let result = block_on(async {
+            lab.write_later(250, "ps.txt", listing(wrapper, sandbox));
+            stop_all_with(Some(app), env).await
+        });
+        assert!(result.is_ok());
+        assert_eq!(lab.log("sandbox.log"), "term\n");
+        assert!(!lab.path("flatpak-kill.log").exists());
+    }
+
+    /// An app that ignores SIGTERM and whose instance `ps` never makes ready: one
+    /// SIGTERM to the recorded process at the limit, then SIGKILL.
+    fn assert_termed_once_then_killed(lab: &Lab) {
+        let log = lab.path("app.log");
+        let app = lab.launched_flatpak(STUBBORN, &[log.to_str().unwrap()]);
+        wait_for(&lab.path("app.log.ready"));
+        let record = app.flatpak.clone().unwrap();
+        if !lab.path("ps_fail").exists() && !lab.path("ps.txt").exists() {
+            // Neither a failing nor an empty listing: the not-ready case.
+            lab.write("ps.txt", &listing(record.pid, 0));
+        }
+        let started = Instant::now();
+        let result = block_on(stop_all_with(Some(app), lab.env(1500)));
+        assert!(result.is_ok(), "the app should be gone");
+        assert!(!record.alive());
+        assert_eq!(lab.log("app.log"), "term\n", "exactly one SIGTERM");
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "no signal before the limit"
+        );
+    }
+
+    // Item 3, at the limit.
+    #[test]
+    fn a_never_ready_instance_gets_one_sigterm_then_sigkill() {
+        assert_termed_once_then_killed(&Lab::new());
+    }
+
+    // Item 5: `flatpak ps` failing throughout.
+    #[test]
+    fn a_failing_flatpak_ps_still_gets_a_sigterm_before_the_sigkill() {
+        let lab = Lab::new();
+        lab.write("ps_fail", "");
+        assert_termed_once_then_killed(&lab);
+    }
+
+    // The instance never being listed gets the same treatment.
+    #[test]
+    fn an_instance_never_listed_gets_one_sigterm_then_sigkill() {
+        let lab = Lab::new();
+        lab.write("ps.txt", "");
+        assert_termed_once_then_killed(&lab);
+    }
+
+    // One SIGTERM per process: a Chromium-like app that needs longer than the stop
+    // timeout to shut down is closed over two closes, and the second must not term it.
+    #[test]
+    fn a_slow_chromium_like_app_gets_one_sigterm_across_closes() {
+        let lab = Lab::new();
+        let sandbox = lab.spawn(CHROMIUM, "sandbox.log", &["60"]);
+        let app = lab.launched_flatpak(WATCHER, &[&sandbox.to_string()]);
+        let wrapper = app.flatpak.as_ref().unwrap().pid;
+        lab.write("ps.txt", &listing(wrapper, sandbox));
+        block_on(async {
+            let first = stop_all_with(Some(app), lab.env(800)).await;
+            assert!(
+                matches!(first, Err(StopError::Timeout)),
+                "still shutting down"
+            );
+            // Generous: the app needs 3 s, and a loaded machine can stretch that.
+            let again = stop_all_with(None, lab.env(8000)).await;
+            assert!(again.is_ok(), "the second close only waits");
+        });
+        assert_eq!(lab.log("sandbox.log"), "term\nclean\n");
+    }
+
+    /// Closes a stubborn app whose SIGTERM an earlier close already sent, with `ps`
+    /// listing it as `listed`; returns the result, with nothing signalled twice.
+    fn close_termed_record(lab: &Lab, listed: impl Fn(u32) -> String) -> Result<(), StopError> {
+        let pid = lab.spawn(STUBBORN, "app.log", &[]);
+        let record = FlatpakApp {
+            app: APP.into(),
+            pid,
+            start_time: proc_stat(pid).unwrap().start_time,
+            termed: true,
+            kill_attempts: 0,
+        };
+        let env = lab.env(500);
+        save_flatpaks(&env.records, &[record]);
+        lab.write("ps.txt", &listed(pid));
+        let result = block_on(stop_all_with(None, env));
+        assert_eq!(lab.log("app.log"), "", "no second SIGTERM");
+        result
+    }
+
+    // A record an earlier close already SIGTERMed is not held up waiting for the
+    // sandbox to be ready, and `flatpak kill` cannot reach an instance that is not
+    // ready, so the recorded process gets the SIGKILL.
+    #[test]
+    fn a_termed_record_with_a_not_ready_instance_is_sigkilled() {
+        let lab = Lab::new();
+        let result = close_termed_record(&lab, |pid| listing(pid, 0));
+        assert!(result.is_ok(), "the SIGKILL removed it");
+        assert!(!lab.path("flatpak-kill.log").exists());
+    }
+
+    // With the instance ready, `flatpak kill` is the way to remove it.
+    #[test]
+    fn a_termed_record_with_a_ready_instance_gets_flatpak_kill() {
+        let lab = Lab::new();
+        // The stub's `flatpak kill` removes nothing, so the app stays: stuck.
+        let result = close_termed_record(&lab, |pid| listing(pid, pid));
+        assert!(matches!(result, Err(StopError::Timeout)));
+        assert_eq!(lab.log("flatpak-kill.log"), "1234567\n");
+    }
+
+    // Item 2: a recycled pid is never signalled.
+    #[test]
+    fn a_record_whose_pid_was_reused_does_not_signal() {
+        let lab = Lab::new();
+        let pid = lab.spawn(POLITE, "app.log", &[]);
+        let start_time = proc_stat(pid).unwrap().start_time;
+        let record = |start_time| FlatpakApp {
+            app: APP.into(),
+            pid,
+            start_time,
+            termed: false,
+            kill_attempts: 0,
+        };
+        assert!(!record(start_time + 1).signal(libc::SIGTERM));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(lab.log("app.log"), "", "the other process was left alone");
+        assert!(record(start_time).signal(libc::SIGTERM));
+        wait_until_logged(&lab, "app.log", "term\n");
+    }
+
+    fn wait_until_logged(lab: &Lab, log: &str, expected: &str) {
+        for _ in 0..300 {
+            if lab.log(log) == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(lab.log(log), expected);
+    }
+
+    /// A record for a launch whose process has since exited.
+    fn exited_launch(lab: &Lab) -> FlatpakApp {
+        let pid = lab.spawn(POLITE, "launch.log", &[]);
+        let record = FlatpakApp {
+            app: APP.into(),
+            pid,
+            start_time: proc_stat(pid).unwrap().start_time,
+            termed: false,
+            kill_attempts: 0,
+        };
+        // SAFETY: the helper just started above.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        for _ in 0..300 {
+            if pid_gone(pid) {
+                return record;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the launch process did not exit");
+    }
+
+    // Item 4: another instance of the app, started before this launch, is not this
+    // launch's leftover.
+    #[test]
+    fn an_older_instance_of_the_app_is_not_an_early_exit() {
+        let lab = Lab::new();
+        let older = lab.spawn(POLITE, "older.log", &[]);
+        std::thread::sleep(Duration::from_millis(60));
+        let record = exited_launch(&lab);
+        lab.write("ps.txt", &listing(older, older));
+        let env = lab.env(500);
+        let warned = block_on(early_exit(&record, &env, Duration::from_millis(1500)));
+        assert!(!warned);
+    }
+
+    #[test]
+    fn an_instance_started_by_the_launch_after_its_process_exits_is_reported() {
+        let lab = Lab::new();
+        let record = exited_launch(&lab);
+        // What a `flatpak run` that forks rather than execs would leave behind.
+        let leftover = lab.spawn(POLITE, "leftover.log", &[]);
+        lab.write("ps.txt", &listing(leftover, leftover));
+        let env = lab.env(500);
+        let warned = block_on(early_exit(&record, &env, Duration::from_millis(1500)));
+        assert!(warned);
+    }
+
+    #[test]
+    fn another_app_listed_is_not_an_early_exit() {
+        let lab = Lab::new();
+        let record = exited_launch(&lab);
+        let other = lab.spawn(POLITE, "other.log", &[]);
+        lab.write("ps.txt", &format!("1 {other} {other} org.example.Other\n"));
+        let env = lab.env(500);
+        let warned = block_on(early_exit(&record, &env, Duration::from_millis(1500)));
+        assert!(!warned);
+    }
+
+    // A close that begins before the app registered with systemd: the launcher
+    // signals the app's own process, once, and still stops its scope afterwards.
+    #[test]
+    fn a_close_before_the_scope_registers_still_closes_the_app() {
+        let lab = Lab::new();
+        let app = lab.launched_scoped("vextheater-app-t-0.scope", POLITE, "app.log");
+        let pid = pid_of(&app.process);
+        let result = block_on(stop_all_with(Some(app), lab.env(3000)));
+        assert!(result.is_ok());
+        assert!(pid_gone(pid));
+        assert_eq!(lab.log("app.log"), "term\n");
+        let calls = std::fs::read_to_string(lab.path("systemctl.log")).unwrap();
+        assert!(calls.contains("--user stop vextheater-app-t-0.scope"));
+    }
+
+    // Once registered, systemd delivers the SIGTERM; the launcher sends none itself.
+    #[test]
+    fn a_registered_scope_gets_its_sigterm_from_systemctl_only() {
+        let lab = Lab::new();
+        let app = lab.launched_scoped("vextheater-app-t-0.scope", POLITE, "app.log");
+        lab.write(
+            "units.txt",
+            "vextheater-app-t-0.scope loaded active running\n",
+        );
+        lab.write("stop_term_pid", &pid_of(&app.process).to_string());
+        let result = block_on(stop_all_with(Some(app), lab.env(3000)));
+        assert!(result.is_ok());
+        assert_eq!(lab.log("app.log"), "term\n");
+    }
+
+    // Scopes that cannot be listed: nothing is signalled and the app is handed back.
+    #[test]
+    fn an_unlistable_scope_set_signals_nothing_and_returns_the_app() {
+        let lab = Lab::new();
+        let app = lab.launched_scoped("vextheater-app-t-0.scope", POLITE, "app.log");
+        lab.write("list_fail", "");
+        let result = block_on(stop_all_with(Some(app), lab.env(3000)));
+        assert!(matches!(result, Err(StopError::Unknown(Some(_)))));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(lab.log("app.log"), "");
     }
 }

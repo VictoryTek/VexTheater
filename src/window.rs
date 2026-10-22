@@ -118,16 +118,48 @@ enum Request {
     Tile(String, Action),
 }
 
+/// Lets one close run at a time. A request made while a close is running only replaces
+/// the pending one, so when the close finishes, just the latest request is acted on.
+struct CloseQueue<T> {
+    closing: Cell<bool>,
+    pending: RefCell<Option<T>>,
+}
+
+impl<T> CloseQueue<T> {
+    fn new() -> Self {
+        CloseQueue {
+            closing: Cell::new(false),
+            pending: RefCell::new(None),
+        }
+    }
+
+    /// Makes `request` the pending one. True if no close was running, so the caller
+    /// starts one.
+    fn submit(&self, request: T) -> bool {
+        self.pending.replace(Some(request));
+        !self.closing.replace(true)
+    }
+
+    /// The running close has finished: the latest request, if still wanted.
+    fn finish(&self) -> Option<T> {
+        self.closing.set(false);
+        self.pending.take()
+    }
+
+    /// Drops the pending request, e.g. when the launcher hides for desktop mode.
+    fn cancel(&self) {
+        self.pending.replace(None);
+    }
+}
+
 struct Ui {
     config: Config,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     /// The app started from a tile, if it is still running.
     running: RefCell<Option<launch::Running>>,
-    /// Whether a close is running; see `close_then`.
-    closing: Cell<bool>,
-    /// The latest request made since the running close began.
-    pending: RefCell<Option<Request>>,
+    /// Serialises closes; see `close_then`.
+    closes: CloseQueue<Request>,
     stack: gtk::Stack,
     /// First tile of each page, focused when the page opens.
     first_tiles: RefCell<HashMap<String, gtk::Button>>,
@@ -181,8 +213,7 @@ impl Ui {
             window: window.clone(),
             toasts,
             running: RefCell::default(),
-            closing: Cell::new(false),
-            pending: RefCell::default(),
+            closes: CloseQueue::new(),
             stack,
             first_tiles: RefCell::default(),
             history: RefCell::default(),
@@ -234,7 +265,7 @@ impl Ui {
     /// Hides the launcher. A tile or home chosen during a close that is still running
     /// is cancelled, so no app starts over the desktop once it finishes.
     fn desktop_mode(&self) {
-        self.pending.replace(None);
+        self.closes.cancel();
         mode::save(Mode::Desktop);
         gnome::restore();
         self.window.set_visible(false);
@@ -418,8 +449,7 @@ impl Ui {
     /// The close is handed the app started last, so it can close that app by its own
     /// process even if the app has not registered with systemd or Flatpak yet.
     fn close_then(self: &Rc<Self>, request: Request) {
-        self.pending.replace(Some(request));
-        if self.closing.replace(true) {
+        if !self.closes.submit(request) {
             // Nothing has started since that close began, so `running` is empty.
             return;
         }
@@ -427,8 +457,7 @@ impl Ui {
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let closed = launch::stop_all(launched).await;
-            ui.closing.set(false);
-            let request = ui.pending.take();
+            let request = ui.closes.finish();
             match closed {
                 Ok(()) => {}
                 Err(launch::StopError::Timeout) => ui
@@ -601,4 +630,28 @@ fn hint(key: &str, action: &str) -> gtk::Box {
     hint.append(&cap);
     hint.append(&text);
     hint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CloseQueue;
+
+    #[test]
+    fn rapid_picks_start_one_close_and_act_only_on_the_last() {
+        let queue = CloseQueue::new();
+        assert!(queue.submit("brave"), "the first pick starts the close");
+        assert!(!queue.submit("freetube"), "later picks only replace it");
+        assert!(!queue.submit("kodi"));
+        assert_eq!(queue.finish(), Some("kodi"));
+        assert_eq!(queue.finish(), None, "a request is acted on once");
+        assert!(queue.submit("brave"), "the next pick starts a new close");
+    }
+
+    #[test]
+    fn desktop_mode_cancels_the_pending_request() {
+        let queue = CloseQueue::new();
+        assert!(queue.submit("brave"));
+        queue.cancel();
+        assert_eq!(queue.finish(), None);
+    }
 }

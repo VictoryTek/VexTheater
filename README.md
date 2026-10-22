@@ -82,15 +82,24 @@ launcher uses a plain dark gradient.
     at once, a double Enter) still closes it. A Flatpak app's own process inside the
     sandbox gets one SIGTERM, so Flatpak Chromium apps shut down cleanly too. That is
     the sandbox's first process (`child-pid` in `flatpak ps`), or, when that is bwrap's
-    init, its children, or the init itself if it has none yet. While Flatpak has not
-    written the sandbox info yet (`child-pid` 0), the launcher-side process gets the
-    SIGTERM instead, which takes the sandbox with it. Signals are sent with `kill(2)`
-    directly, and never to pid 0 (the launcher's own process group), pid 1 or the
-    launcher itself.
+    init, its children, or the init itself if it has none yet. Nothing is signalled
+    until `flatpak ps` lists the instance with its sandbox info (`child-pid` not 0),
+    which can take a moment after the launch: the launcher keeps polling for up to 5 s,
+    since signalling the launcher-side process earlier takes the sandbox with it and
+    the app never shuts down cleanly. If it still is not ready after 5 s (`flatpak ps`
+    failing, or the instance never listed or never ready), the recorded launcher-side
+    process gets the one SIGTERM instead, and a SIGKILL after another 5 s. Signals are
+    sent with `kill(2)` directly, never to pid 0 (the launcher's own process group),
+    pid 1 or the launcher itself, and the recorded process only after its pid and
+    start time are checked again right before sending, so a reused pid is not hit. A
+    record whose SIGTERM an earlier close already sent does not wait for readiness
+    either: one `flatpak ps` listing is enough. With the instance ready it then gets
+    `flatpak kill`; with it unlisted or not ready, which `flatpak kill` cannot reach,
+    the recorded process gets the SIGKILL.
   - Scopes get 5 s to exit; any still there are then killed, by name, and get up to
     2 s more to disappear. A Flatpak instance gets 5 s after its SIGTERM, then
-    `flatpak kill` on that instance. A `systemctl stop` that fails is checked against a
-    fresh listing rather than taken as success.
+    `flatpak kill` on that instance (or the SIGKILL above). A `systemctl stop` that
+    fails is checked against a fresh listing rather than taken as success.
   - If something is still running at the end, the launcher shows "Couldn't close the
     previous app" and starts the next tile anyway. A Flatpak instance that did not
     close stays recorded with a note that its SIGTERM was sent; every later close
@@ -105,11 +114,14 @@ launcher uses a plain dark gradient.
     list the scopes, then the slowest of the scopes (5 s to stop, 2 s to re-check a
     failed stop, 2 s of kill grace and 2 s for its last check, 11 s), an app started
     last whose scope registered during the close (5 s to exit, 2 s to kill, then the
-    same 11 s for its scope, 18 s) and a Flatpak instance (5 s to find it, 5 s to exit
-    after its SIGTERM, then `flatpak kill` and its effect share 2 s, 12 s).
-  - If a launched Flatpak's process exits within moments while `flatpak ps` still lists
-    the app, the launcher logs a warning (in the journal, as `vextheater`) that the
-    one-process-id assumption does not hold on this system.
+    same 11 s for its scope, 18 s) and a Flatpak instance (5 s to find it ready, 5 s to
+    exit after its SIGTERM, then `flatpak kill` or the SIGKILL and its effect share
+    2 s, 12 s).
+  - If a launched Flatpak's process exits within moments while `flatpak ps` lists an
+    instance of the app that started after the launch, the launcher logs a warning (in
+    the journal, as `vextheater`) that the one-process-id assumption does not hold on
+    this system. Older instances of the same app (a stuck earlier one, or one opened
+    from the desktop earlier) are ignored.
 - Desktop mode hides the launcher; running `vextheater` again (e.g. "Theater Mode" in
   the app grid) shows it.
 - With `autostart`, the launcher runs as the `vextheater --resume` systemd user
@@ -186,3 +198,7 @@ These depend on the real desktop, so they can only be checked on the machine:
 nix develop -c cargo run        # VEXTHEATER_CONFIG=./example.json to try a layout
 bash scripts/preflight.sh       # fmt, clippy, tests, desktop/AppStream validation, nix build
 ```
+
+The start and close lifecycle is covered end to end by `launch::lifecycle_tests`: real
+processes, stub `flatpak` and `systemctl` programs and millisecond timings, so it runs
+without Flatpak or systemd. The device checks above still need the real machine.
