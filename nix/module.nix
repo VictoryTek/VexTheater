@@ -21,7 +21,9 @@ in
       description = "The VexTheater package to install.";
     };
 
-    autostart = lib.mkEnableOption "starting VexTheater with every graphical session";
+    autostart = lib.mkEnableOption ''
+      starting VexTheater with every graphical session, as a systemd user service
+      that is restarted if it crashes'';
 
     settings = lib.mkOption {
       type = json.type;
@@ -43,13 +45,28 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ]
-      ++ lib.optional cfg.autostart (pkgs.makeAutostartItem {
-        name = "io.github.vextheater";
-        package = cfg.package;
-      });
+    environment.systemPackages = [ cfg.package ];
 
     environment.etc."vextheater/config.json".source = json.generate "vextheater-config.json" cfg.settings;
+
+    # The session's graphical-session.target pattern (systemd.special(7)). Apps
+    # started from tiles move into scopes of their own, so a restart of this service
+    # leaves them running.
+    systemd.user.services.vextheater = lib.mkIf cfg.autostart {
+      description = "VexTheater TV launcher";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      unitConfig.ConditionEnvironment = "WAYLAND_DISPLAY";
+      # Tile commands run through sh and find their programs (flatpak, browsers, …)
+      # on PATH, so keep the session's PATH instead of NixOS's minimal service one.
+      enableDefaultPath = false;
+      serviceConfig = {
+        ExecStart = lib.getExe cfg.package;
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+    };
 
     # Same reason as VexPortal: GNOME Shell's app grid reads the aggregated icon
     # cache, which is only rebuilt when this is on (it defaults to

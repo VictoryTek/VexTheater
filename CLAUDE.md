@@ -14,12 +14,12 @@ On a Windows checkout, run these through WSL (`wsl -e bash -lc 'cd /mnt/c/Projec
 
 ## Repository
 
-- `src/` — `main.rs` (GApplication), `config.rs` (JSON schema + validation), `window.rs` (launcher UI: pages, tiles, navigation, pointer hiding), `clock.rs` (time, date, greeting)
+- `src/` — `main.rs` (GApplication), `config.rs` (JSON schema + validation), `window.rs` (launcher UI: pages, tiles, navigation, pointer hiding; theater/desktop mode; `--home`), `clock.rs` (time, date, greeting), `launch.rs` (systemd scopes, Flatpak, power), `gnome.rs` (hot corner / banner settings)
 - `data/` — desktop file, AppStream metainfo, icon, `style.css`, gresource manifest (compiled by `build.rs`)
-- `nix/` — `package.nix` (rustPlatform.buildRustPackage), `module.nix` (`programs.vextheater`: install, autostart, `settings` → `/etc/vextheater/config.json`)
+- `nix/` — `package.nix` (rustPlatform.buildRustPackage), `module.nix` (`programs.vextheater`: install, `autostart` as a systemd user service in graphical-session.target, `settings` → `/etc/vextheater/config.json`)
 - Consumer: vexos-nix `modules/htpc-theater.nix` builds `settings` from `vexos.htpc.theater.apps` and binds the home key. The JSON schema in `config.rs` (documented in README.md) is a contract with that module: change both together.
 - Architecture: the launcher is a fullscreen window in the GNOME session. Tile apps run in their own `systemd-run --user --scope` so the home action can stop the whole app; closing it returns focus to the launcher. Sizes are logical pixels; GNOME's display scale handles 4K.
-- Untracked files are invisible to a `git+file` flake ref; always use `path:.`.
+- Untracked files are invisible to a `git+file` flake ref; always use `path:.`. A `path:` ref copies the whole directory (ignoring .gitignore) into the Nix store on every invocation, so never let cargo write `target/` inside the repo: use `CARGO_TARGET_DIR=$HOME/.cache/vextheater/target` (preflight sets it). A repo-local target/ once filled 56 GB of store copies in a day.
 
 ## Forbidden commands
 

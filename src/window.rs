@@ -1,8 +1,10 @@
 //! The launcher window: wallpaper, clock, and one page per tile row (the main row and
-//! each submenu), with keyboard and mouse navigation.
+//! each submenu), with keyboard and mouse navigation. Also theater and desktop mode:
+//! the launcher is shown full screen, or hidden to leave the GNOME desktop.
 
 use crate::clock::Clock;
-use crate::config::{Action, Config, Tile};
+use crate::config::{Action, Builtin, Config, Tile};
+use crate::{gnome, launch};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -12,11 +14,60 @@ use std::time::Duration;
 const MAIN_PAGE: &str = "main";
 const ICON_SIZE: i32 = 96;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
+const QUICK_FAILURE: Duration = Duration::from_secs(5);
 
-pub fn present(application: &adw::Application) {
-    if let Some(window) = application.active_window() {
+thread_local! {
+    static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
+}
+
+/// Handles `vextheater` and `vextheater --home`, run here or forwarded from another
+/// process to this, the running instance.
+pub fn command_line(
+    application: &adw::Application,
+    command_line: &gio::ApplicationCommandLine,
+) -> i32 {
+    let arguments = command_line.arguments();
+    let flags: Vec<_> = arguments
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy())
+        .collect();
+    match flags.as_slice() {
+        [] => {
+            activate(application);
+            0
+        }
+        [flag] if flag == "--home" => {
+            if let Some(ui) = ui(application) {
+                ui.home();
+            }
+            0
+        }
+        _ => {
+            command_line.printerr_literal(
+                "usage: vextheater [--home]\n  --home  close the open app and show the launcher\n",
+            );
+            2
+        }
+    }
+}
+
+/// Shows the launcher (theater mode), e.g. from "Theater Mode" in the app grid.
+pub fn activate(application: &adw::Application) {
+    if let Some(ui) = ui(application) {
+        ui.show();
+    }
+}
+
+/// The launcher, built on first use. None when the configuration cannot be read; the
+/// window then shows the error instead.
+fn ui(application: &adw::Application) -> Option<Rc<Ui>> {
+    if let Some(ui) = UI.with_borrow(Clone::clone) {
+        return Some(ui);
+    }
+    if let Some(window) = application.windows().first() {
         window.present();
-        return;
+        return None;
     }
 
     let window = adw::ApplicationWindow::builder()
@@ -25,7 +76,11 @@ pub fn present(application: &adw::Application) {
         .build();
 
     match Config::load_default() {
-        Ok(config) => Ui::build(&window, config),
+        Ok(config) => {
+            let ui = Ui::build(&window, config);
+            UI.set(Some(ui.clone()));
+            Some(ui)
+        }
         Err(error) => {
             log::error!("{error:#}");
             window.set_content(Some(
@@ -35,15 +90,31 @@ pub fn present(application: &adw::Application) {
                     .description(format!("{error:#}"))
                     .build(),
             ));
+            window.fullscreen();
+            window.present();
+            None
         }
     }
+}
 
-    window.fullscreen();
-    window.present();
+/// What to do once the open app is closed.
+enum Request {
+    /// Stay on the launcher.
+    Home,
+    /// Start this tile's app (tile name, action).
+    Tile(String, Action),
 }
 
 struct Ui {
     config: Config,
+    window: adw::ApplicationWindow,
+    toasts: adw::ToastOverlay,
+    /// The app started from a tile, if it is still running.
+    running: RefCell<Option<launch::Running>>,
+    /// Whether a close is running; see `close_then`.
+    closing: Cell<bool>,
+    /// The latest request made since the running close began.
+    pending: RefCell<Option<Request>>,
     stack: gtk::Stack,
     /// First tile of each page, focused when the page opens.
     first_tiles: RefCell<HashMap<String, gtk::Button>>,
@@ -56,7 +127,7 @@ struct Ui {
 }
 
 impl Ui {
-    fn build(window: &adw::ApplicationWindow, config: Config) {
+    fn build(window: &adw::ApplicationWindow, config: Config) -> Rc<Self> {
         let overlay = gtk::Overlay::new();
         overlay.add_css_class("theater");
 
@@ -89,8 +160,16 @@ impl Ui {
         let clock = Clock::new();
         overlay.add_overlay(&clock.widget);
 
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&overlay));
+
         let ui = Rc::new(Ui {
             config,
+            window: window.clone(),
+            toasts,
+            running: RefCell::default(),
+            closing: Cell::new(false),
+            pending: RefCell::default(),
             stack,
             first_tiles: RefCell::default(),
             history: RefCell::default(),
@@ -117,9 +196,30 @@ impl Ui {
         window.add_controller(keys);
 
         ui.hide_idle_pointer(window);
-        window.set_content(Some(&overlay));
+        window.set_content(Some(&ui.toasts));
         let first = ui.first_tiles.borrow().get(MAIN_PAGE).cloned();
         GtkWindowExt::set_focus(window, first.as_ref());
+        ui
+    }
+
+    /// Theater mode: the launcher full screen over the desktop.
+    fn show(&self) {
+        gnome::theater_mode();
+        self.window.fullscreen();
+        self.window.present();
+    }
+
+    /// Closes the app started from a tile, or left over from a launcher that crashed,
+    /// and returns to the main row.
+    fn home(self: &Rc<Self>) {
+        self.close_then(Request::Home);
+        while self.back() {}
+        self.show();
+    }
+
+    fn desktop_mode(&self) {
+        gnome::restore();
+        self.window.set_visible(false);
     }
 
     /// One row of tiles with its header, selected-tile title and key hints.
@@ -245,10 +345,124 @@ impl Ui {
         &tiles[index]
     }
 
-    fn activate(&self, tile: &Tile, button: &gtk::Button) {
-        match &tile.action {
-            Action::Submenu(name) => self.open(&submenu_page(name), button),
-            action => log::warn!("launching is not implemented yet: {action:?}"),
+    fn activate(self: &Rc<Self>, tile: &Tile, button: &gtk::Button) {
+        let result = match &tile.action {
+            Action::Submenu(name) => {
+                self.open(&submenu_page(name), button);
+                Ok(())
+            }
+            Action::Builtin(Builtin::DesktopMode) => {
+                self.desktop_mode();
+                Ok(())
+            }
+            Action::Builtin(Builtin::Shutdown) => self.power(tile, "poweroff"),
+            Action::Builtin(Builtin::Restart) => self.power(tile, "reboot"),
+            action => {
+                self.launch(tile, action);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.failed(&tile.name, &error);
+        }
+    }
+
+    fn failed(&self, name: &str, error: &anyhow::Error) {
+        log::error!("{name}: {error:#}");
+        self.toasts
+            .add_toast(adw::Toast::new(&format!("Couldn't open {name}")));
+    }
+
+    /// systemctl fails when logind refuses, e.g. while another user is logged in.
+    fn power(self: &Rc<Self>, tile: &Tile, verb: &str) -> anyhow::Result<()> {
+        let process = launch::systemctl(verb)?;
+        let (ui, name) = (self.clone(), tile.name.clone());
+        process.wait_check_async(None::<&gio::Cancellable>, move |result| {
+            if let Err(error) = result {
+                ui.failed(&name, &error.into());
+            }
+        });
+        Ok(())
+    }
+
+    /// One app at a time: the previous one is closed, and the new one starts once it
+    /// is gone. A tile chosen while that is pending replaces the pending one.
+    fn launch(self: &Rc<Self>, tile: &Tile, action: &Action) {
+        self.close_then(Request::Tile(tile.name.clone(), action.clone()));
+    }
+
+    /// Closes the open app (and any left by a crashed launcher), then acts on the
+    /// request. At most one close runs at a time: a tile or home chosen while one is
+    /// running only replaces the pending request, and the close acts on the latest
+    /// one when it finishes. Nothing starts while a close runs, so it never races an
+    /// app it should leave alone, and only it and `start` touch the Flatpak record.
+    fn close_then(self: &Rc<Self>, request: Request) {
+        self.running.take();
+        self.pending.replace(Some(request));
+        if self.closing.replace(true) {
+            return;
+        }
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let closed = launch::stop_all().await;
+            ui.closing.set(false);
+            let request = ui.pending.take();
+            match closed {
+                Ok(()) => {}
+                Err(launch::StopError::Timeout) => ui
+                    .toasts
+                    .add_toast(adw::Toast::new("Couldn't close the previous app")),
+                Err(launch::StopError::Unknown) => {
+                    // The previous app may still be running: start nothing over it.
+                    // Choosing the tile again retries the close.
+                    ui.toasts.add_toast(adw::Toast::new(
+                        "Couldn't check whether the previous app closed",
+                    ));
+                    return;
+                }
+            }
+            if let Some(Request::Tile(name, action)) = request {
+                ui.start(&name, &action);
+            }
+        });
+    }
+
+    fn start(self: &Rc<Self>, name: &str, action: &Action) {
+        let running = match launch::start(action) {
+            Ok(running) => running,
+            Err(error) => return self.failed(name, &error),
+        };
+        let (ui, unit, name) = (self.clone(), running.unit.clone(), name.to_owned());
+        running
+            .process
+            .wait_check_async(None::<&gio::Cancellable>, move |result| {
+                ui.app_exited(&unit, &name, result)
+            });
+        self.running.replace(Some(running));
+    }
+
+    /// GNOME focuses the launcher once the app's window is gone; presenting it again
+    /// covers an app that leaves other windows behind. An app that fails within
+    /// [`QUICK_FAILURE`] (not found, not installed) is reported. Apps the launcher
+    /// closed itself are no longer in `running`, so they are not.
+    fn app_exited(&self, unit: &str, name: &str, result: Result<(), glib::Error>) {
+        let finished = {
+            let mut running = self.running.borrow_mut();
+            match running.as_ref() {
+                Some(r) if r.unit == unit => running.take(),
+                _ => None,
+            }
+        };
+        let Some(finished) = finished else {
+            return;
+        };
+        if let Err(error) = result {
+            if finished.started.elapsed() < QUICK_FAILURE {
+                self.failed(name, &error.into());
+            }
+        }
+        if self.window.is_visible() {
+            self.window.present();
         }
     }
 

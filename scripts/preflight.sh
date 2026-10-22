@@ -2,8 +2,11 @@
 # preflight.sh — VexTheater pre-push validation. Also what CI runs.
 # Usage, from the repository root: bash scripts/preflight.sh
 #
-# `path:.` rather than `.` so untracked new files are part of the flake.
+# `path:.` rather than `.` so untracked new files are part of the flake. A `path:`
+# flake copies the whole directory into the Nix store on every run, .gitignore or
+# not, so cargo builds outside it: a target/ inside would add gigabytes per run.
 set -euo pipefail
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/vextheater/target}"
 
 dev() { nix develop path:. -c "$@"; }
 

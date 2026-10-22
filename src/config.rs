@@ -1,9 +1,6 @@
 //! The launcher configuration: tiles, submenus and the background, read from the JSON
 //! file the NixOS module writes.
 
-// The action payloads are read by app launching, which is not built yet.
-#![allow(dead_code)]
-
 use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -44,7 +41,7 @@ pub struct Tile {
     pub action: Action,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     /// A shell command line.

@@ -88,11 +88,8 @@ fn update(time: &gtk::Label, date: &gtk::Label, greetings: &[gtk::Label], format
     }
 }
 
-/// Follows GNOME's clock setting when its schema is installed (not in a bare dev shell).
+/// Follows GNOME's clock setting.
 fn uses_24h_clock() -> bool {
-    const SCHEMA: &str = "org.gnome.desktop.interface";
-    let installed = gio::SettingsSchemaSource::default()
-        .and_then(|source| source.lookup(SCHEMA, true))
-        .is_some();
-    installed && gio::Settings::new(SCHEMA).string("clock-format") == "24h"
+    crate::gnome::settings("org.gnome.desktop.interface")
+        .is_some_and(|settings| settings.string("clock-format") == "24h")
 }

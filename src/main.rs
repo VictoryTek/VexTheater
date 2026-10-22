@@ -2,6 +2,8 @@
 
 mod clock;
 mod config;
+mod gnome;
+mod launch;
 mod window;
 
 use adw::prelude::*;
@@ -9,13 +11,22 @@ use adw::prelude::*;
 /// Also the gresource prefix.
 pub const APP_ID: &str = "io.github.vextheater";
 
+// Linux signal numbers, for glib::unix_signal_add_local.
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
 fn main() -> glib::ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     gio::resources_register_include!("compiled.gresource")
         .expect("the compiled gresource bundle should be embedded in the binary");
 
-    let application = adw::Application::builder().application_id(APP_ID).build();
+    // Command lines go to the running instance, so `vextheater --home` from a keyboard
+    // shortcut acts on the launcher that is already open.
+    let application = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
 
     application.connect_startup(|_| {
         adw::init().expect("libadwaita should initialise");
@@ -23,7 +34,20 @@ fn main() -> glib::ExitCode {
         load_stylesheet();
     });
 
-    application.connect_activate(window::present);
+    application.connect_command_line(window::command_line);
+    application.connect_activate(window::activate);
+
+    // Every way out ends here: quitting, closing the last window (Alt+F4), and the
+    // signals below, which systemd sends when the session ends.
+    application.connect_shutdown(|_| gnome::restore());
+    for signal in [SIGINT, SIGTERM] {
+        let application = application.clone();
+        glib::unix_signal_add_local(signal, move || {
+            application.quit();
+            glib::ControlFlow::Break
+        });
+    }
+
     application.run()
 }
 
