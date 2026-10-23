@@ -13,6 +13,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const MAIN_PAGE: &str = "main";
+const PAGE_MARGIN: i32 = 96;
+const TILE_SPACING: i32 = 40;
+/// Tiles are this big when the screen has room, and shrink to fit the row on it.
+const TILE_MAX: i32 = 200;
+const TILE_MIN: i32 = 100;
 const ICON_SIZE: i32 = 96;
 const LOGO_WIDTH: i32 = 200;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
@@ -164,6 +169,8 @@ struct Ui {
     stack: gtk::Stack,
     /// First tile of each page, focused when the page opens.
     first_tiles: RefCell<HashMap<String, gtk::Button>>,
+    /// The row of tiles on each page, resized to the window by `fit_tiles`.
+    rows: RefCell<Vec<gtk::Box>>,
     /// Pages left by opening a submenu, with the tile that opened each.
     history: RefCell<Vec<(String, gtk::Button)>>,
     /// Hover selects a tile only while the pointer is shown, so a tile moving under a
@@ -231,6 +238,7 @@ impl Ui {
             closes: CloseQueue::new(),
             stack,
             first_tiles: RefCell::default(),
+            rows: RefCell::default(),
             history: RefCell::default(),
             pointer_visible: Cell::new(false),
             clock,
@@ -253,6 +261,18 @@ impl Ui {
             }
         });
         window.add_controller(keys);
+
+        // The window is as wide as the screen, whatever its resolution: the tiles are
+        // sized to that once the compositor reports it.
+        window.connect_realize({
+            let ui = ui.clone();
+            move |window| {
+                if let Some(surface) = window.surface() {
+                    let ui = ui.clone();
+                    surface.connect_layout(move |_, width, _| ui.fit_tiles(width));
+                }
+            }
+        });
 
         ui.hide_idle_pointer(window);
         window.set_content(Some(&ui.toasts));
@@ -292,15 +312,15 @@ impl Ui {
             .orientation(gtk::Orientation::Vertical)
             .margin_top(64)
             .margin_bottom(52)
-            .margin_start(96)
-            .margin_end(96)
+            .margin_start(PAGE_MARGIN)
+            .margin_end(PAGE_MARGIN)
             .build();
 
         column.append(&self.header(submenu));
 
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(40)
+            .spacing(TILE_SPACING)
             .halign(gtk::Align::Center)
             .valign(gtk::Align::End)
             .vexpand(true)
@@ -352,6 +372,31 @@ impl Ui {
         }
 
         self.stack.add_named(&column, Some(page));
+        self.rows.borrow_mut().push(row);
+    }
+
+    /// Sizes every row's tiles to fit a window `width` logical pixels wide, so the
+    /// last tile is never pushed off a small screen.
+    fn fit_tiles(&self, width: i32) {
+        for row in self.rows.borrow().iter() {
+            let mut tiles = Vec::new();
+            let mut child = row.first_child();
+            while let Some(tile) = child {
+                child = tile.next_sibling();
+                tiles.push(tile);
+            }
+            let size = tile_size(width, tiles.len());
+            for tile in tiles {
+                tile.set_size_request(size, size);
+                if let Some(icon) = tile
+                    .downcast_ref::<gtk::Button>()
+                    .and_then(|button| button.child())
+                    .and_then(|child| child.downcast::<gtk::Image>().ok())
+                {
+                    icon.set_pixel_size(size * ICON_SIZE / TILE_MAX);
+                }
+            }
+        }
     }
 
     fn header(&self, submenu: Option<&str>) -> gtk::Box {
@@ -605,6 +650,14 @@ impl Ui {
     }
 }
 
+/// The side of a square tile for a row of `count` tiles in a window `width` wide:
+/// [`TILE_MAX`] if the row fits, else smaller, down to [`TILE_MIN`].
+fn tile_size(width: i32, count: usize) -> i32 {
+    let count = i32::try_from(count.max(1)).unwrap_or(i32::MAX);
+    let room = width - 2 * PAGE_MARGIN - TILE_SPACING * (count - 1);
+    (room / count).clamp(TILE_MIN, TILE_MAX)
+}
+
 fn submenu_page(name: &str) -> String {
     format!("submenu:{name}")
 }
@@ -617,10 +670,14 @@ fn tile_button(tile: &Tile) -> gtk::Button {
     };
     icon.set_pixel_size(ICON_SIZE);
 
+    // Small until `fit_tiles` knows the window width: a larger minimum would make the
+    // window wider than a small screen.
     let button = gtk::Button::builder()
         .child(&icon)
         .css_classes(["tile"])
         .valign(gtk::Align::Center)
+        .width_request(TILE_MIN)
+        .height_request(TILE_MIN)
         .build();
     button.update_property(&[gtk::accessible::Property::Label(&tile.name)]);
     button
@@ -649,7 +706,29 @@ fn hint(key: &str, action: &str) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
-    use super::CloseQueue;
+    use super::{tile_size, CloseQueue, TILE_MAX, TILE_MIN};
+
+    #[test]
+    fn tiles_keep_full_size_on_a_wide_screen() {
+        assert_eq!(tile_size(1600, 6), TILE_MAX);
+        assert_eq!(tile_size(1920, 6), TILE_MAX);
+        assert_eq!(tile_size(3840, 6), TILE_MAX);
+    }
+
+    #[test]
+    fn tiles_shrink_so_the_row_fits_a_small_screen() {
+        for width in [1280, 1366, 1440] {
+            let size = tile_size(width, 6);
+            assert!(size < TILE_MAX, "{width}: tiles shrink");
+            assert!(6 * size + 5 * 40 + 2 * 96 <= width, "{width}: the row fits");
+        }
+    }
+
+    #[test]
+    fn tiles_never_shrink_below_the_minimum_or_divide_by_zero() {
+        assert_eq!(tile_size(400, 6), TILE_MIN);
+        assert_eq!(tile_size(1920, 0), TILE_MAX);
+    }
 
     #[test]
     fn rapid_picks_start_one_close_and_act_only_on_the_last() {
