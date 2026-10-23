@@ -6,7 +6,7 @@ use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
-use crate::{gnome, launch};
+use crate::{gnome, launch, order};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -25,6 +25,10 @@ const ICON_SIZE: i32 = 96;
 const LOGO_WIDTH: i32 = 200;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
 const QUICK_FAILURE: Duration = Duration::from_secs(5);
+/// Holding Enter on a tile this long picks it up.
+const LONG_PRESS: Duration = Duration::from_millis(600);
+const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
+const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  Back  done";
 
 thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
@@ -161,6 +165,21 @@ impl<T> CloseQueue<T> {
     }
 }
 
+/// A row of tiles the user can rearrange: the main row and the configured submenus.
+struct Arrangeable {
+    row: gtk::Box,
+    /// In configured order, so a button's position here is its index for `Ui::tile`.
+    buttons: Vec<gtk::Button>,
+}
+
+/// The tile picked up for moving.
+struct Picked {
+    page: String,
+    button: gtk::Button,
+    /// Its place in the row when picked up, to put it back on cancel.
+    from: usize,
+}
+
 struct Ui {
     config: Config,
     window: adw::ApplicationWindow,
@@ -186,6 +205,20 @@ struct Ui {
     /// when a page opens or the window is shown again, and those stay silent.
     navigating: Cell<bool>,
     clock: Clock,
+    arrangeable: RefCell<HashMap<String, Arrangeable>>,
+    /// The arranged order, as saved to disk.
+    saved_order: RefCell<order::Saved>,
+    picked: RefCell<Option<Picked>>,
+    /// Enter picks a tile up instead of opening it, until Back. Set from the power menu,
+    /// for a remote that cannot hold Enter or press Menu.
+    arranging: Cell<bool>,
+    /// Enter is held down. Keyboard auto-repeat sends more presses while it is, and
+    /// they must not pick a tile up or drop it again.
+    enter_down: Cell<bool>,
+    /// Counts down a long press of Enter on a tile.
+    enter_timer: RefCell<Option<glib::SourceId>>,
+    /// What the keys do while a tile is picked up or arranging.
+    arrange_hint: gtk::Label,
 }
 
 impl Ui {
@@ -233,6 +266,14 @@ impl Ui {
         corner.append(&clock.widget);
         overlay.add_overlay(&corner);
 
+        let arrange_hint = label("arrange-hint");
+        arrange_hint.set_halign(gtk::Align::Center);
+        arrange_hint.set_valign(gtk::Align::Start);
+        arrange_hint.set_margin_top(180);
+        arrange_hint.set_visible(false);
+        arrange_hint.set_can_target(false);
+        overlay.add_overlay(&arrange_hint);
+
         // Bottom-right, clear of the tile row and the key hints, like GNOME's
         // background logo. A picture is as wide as its image whatever size is
         // requested, so it sits in a window that has the size and no scroll bars.
@@ -273,14 +314,21 @@ impl Ui {
             sounds: Sounds::new(),
             navigating: Cell::new(false),
             clock,
+            arrangeable: RefCell::default(),
+            saved_order: RefCell::new(order::load()),
+            picked: RefCell::default(),
+            arranging: Cell::new(false),
+            enter_down: Cell::new(false),
+            enter_timer: RefCell::default(),
+            arrange_hint,
         });
 
-        ui.add_page(MAIN_PAGE, None, &ui.config.tiles);
+        ui.add_page(MAIN_PAGE, None, &ui.config.tiles, true);
         for (name, tiles) in &ui.config.submenus {
-            ui.add_page(&submenu_page(name), Some(name), tiles);
+            ui.add_page(&submenu_page(name), Some(name), tiles, true);
         }
         for page in &ui.own_pages {
-            ui.add_page(page.key, Some(page.title), &page.tiles);
+            ui.add_page(page.key, Some(page.title), &page.tiles, false);
         }
         ui.clock.start();
 
@@ -345,6 +393,31 @@ impl Ui {
         });
         window.add_controller(navigation);
 
+        // Picking tiles up and moving them. Capture phase, so a picked tile's arrow keys
+        // never reach GTK's focus movement, and Enter can wait for its release to tell
+        // a tap (open) from a long press (pick up).
+        let arranging = gtk::EventControllerKey::new();
+        arranging.set_propagation_phase(gtk::PropagationPhase::Capture);
+        arranging.connect_key_pressed({
+            let ui = ui.clone();
+            move |_, key, _, _| {
+                if ui.arrange_key(key) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        });
+        arranging.connect_key_released({
+            let ui = ui.clone();
+            move |_, key, _, _| {
+                if is_enter(key) {
+                    ui.enter_released();
+                }
+            }
+        });
+        window.add_controller(arranging);
+
         // The window is as wide as the screen, whatever its resolution: the tiles are
         // sized to that once the compositor reports it.
         window.connect_realize({
@@ -394,14 +467,22 @@ impl Ui {
     /// Leaves every submenu and selects the first tile, not the power button a
     /// submenu may have been opened from.
     fn main_row(&self) {
+        self.stop_arranging();
         while self.back() {}
         if let Some(first) = self.first_tiles.borrow().get(MAIN_PAGE) {
             first.grab_focus();
         }
     }
 
-    /// One row of tiles with its header, selected-tile title and key hints.
-    fn add_page(self: &Rc<Self>, page: &str, submenu: Option<&str>, tiles: &[Tile]) {
+    /// One row of tiles with its header, selected-tile title and key hints. The tiles of
+    /// an `arrangeable` page are shown in the order the user saved for it.
+    fn add_page(
+        self: &Rc<Self>,
+        page: &str,
+        submenu: Option<&str>,
+        tiles: &[Tile],
+        arrangeable: bool,
+    ) {
         let column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .margin_top(64)
@@ -429,9 +510,17 @@ impl Ui {
         column.append(&description);
         column.append(&self.hints(submenu.is_some()));
 
-        for (index, tile) in tiles.iter().enumerate() {
+        let positions = if arrangeable {
+            let names: Vec<_> = tiles.iter().map(|tile| tile.name.as_str()).collect();
+            order::arrange(&names, self.saved_order.borrow().get(page))
+        } else {
+            (0..tiles.len()).collect()
+        };
+        let mut buttons = Vec::new();
+        for (position, index) in positions.into_iter().enumerate() {
+            let tile = &tiles[index];
             let button = tile_button(tile);
-            if index == 0 {
+            if position == 0 {
                 self.first_tiles
                     .borrow_mut()
                     .insert(page.to_owned(), button.clone());
@@ -455,7 +544,9 @@ impl Ui {
             hover.connect_enter({
                 let (ui, button) = (self.clone(), button.downgrade());
                 move |_, _, _| {
-                    if let Some(button) = button.upgrade().filter(|_| ui.pointer_visible.get()) {
+                    // A picked tile keeps the selection until it is dropped.
+                    let steady = ui.pointer_visible.get() && ui.picked.borrow().is_none();
+                    if let Some(button) = button.upgrade().filter(|_| steady) {
                         ui.navigating.set(true);
                         button.grab_focus();
                         ui.navigating.set(false);
@@ -467,16 +558,302 @@ impl Ui {
             button.connect_clicked({
                 let (ui, page) = (self.clone(), page.to_owned());
                 move |button| {
+                    if ui.click_while_arranging(&page, button) {
+                        return;
+                    }
                     ui.sounds.chosen();
                     ui.activate(&page, ui.tile(&page, index), button);
                 }
             });
 
             row.append(&button);
+            buttons.push((index, button));
         }
 
+        if arrangeable {
+            buttons.sort_by_key(|(index, _)| *index);
+            self.arrangeable.borrow_mut().insert(
+                page.to_owned(),
+                Arrangeable {
+                    row: row.clone(),
+                    buttons: buttons.into_iter().map(|(_, button)| button).collect(),
+                },
+            );
+        }
         self.stack.add_named(&column, Some(page));
         self.rows.borrow_mut().push(row);
+    }
+
+    /// The tile with keyboard focus on the visible page, if that page can be rearranged.
+    fn focused_tile(&self) -> Option<(String, gtk::Button)> {
+        let page = self.stack.visible_child_name()?.to_string();
+        let focus = GtkWindowExt::focus(&self.window)?;
+        let arrangeable = self.arrangeable.borrow();
+        let tiles = arrangeable.get(&page)?;
+        let button = tiles
+            .buttons
+            .iter()
+            .find(|b| b.upcast_ref::<gtk::Widget>() == &focus)?;
+        Some((page, button.clone()))
+    }
+
+    /// Handles a key press that picks tiles up, moves or drops them. True if it did.
+    fn arrange_key(self: &Rc<Self>, key: gtk::gdk::Key) -> bool {
+        use gtk::gdk::Key;
+        if is_enter(key) {
+            return self.enter_pressed();
+        }
+        if self.picked.borrow().is_some() {
+            match key {
+                Key::Left => self.move_picked(-1),
+                Key::Right => self.move_picked(1),
+                Key::Menu | Key::F2 => self.drop_picked(),
+                Key::Escape | Key::BackSpace => self.cancel_picked(),
+                // The picked tile keeps the selection.
+                Key::Up | Key::Down | Key::Tab | Key::ISO_Left_Tab => {}
+                _ => return false,
+            }
+            return true;
+        }
+        match key {
+            Key::Menu | Key::F2 => match self.focused_tile() {
+                Some((page, button)) => {
+                    self.pick_up(&page, &button);
+                    true
+                }
+                None => false,
+            },
+            Key::Escape | Key::BackSpace if self.arranging.get() && self.on_main_page() => {
+                self.stop_arranging();
+                self.sounds.chosen();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Enter on a tile of a rearrangeable row: while arranging it picks the tile up at
+    /// once; otherwise the tile opens when Enter is released, unless it is held for
+    /// [`LONG_PRESS`], which picks the tile up. With a tile picked up, Enter drops it.
+    /// True if the press is dealt with here, false to leave it to GTK.
+    fn enter_pressed(self: &Rc<Self>) -> bool {
+        let picked = self.picked.borrow().is_some();
+        let tile = if picked { None } else { self.focused_tile() };
+        if !picked && tile.is_none() {
+            return false;
+        }
+        if self.enter_down.replace(true) {
+            // Auto-repeat of a press that is already dealt with.
+            return true;
+        }
+        match tile {
+            None => self.drop_picked(),
+            Some((page, button)) if self.arranging.get() => self.pick_up(&page, &button),
+            Some((page, button)) => {
+                let ui = self.clone();
+                self.enter_timer.replace(Some(glib::timeout_add_local_once(
+                    LONG_PRESS,
+                    move || {
+                        ui.enter_timer.take();
+                        ui.pick_up(&page, &button);
+                    },
+                )));
+            }
+        }
+        true
+    }
+
+    /// A tap of Enter on a tile opens it now that the key is up; after a long press the
+    /// tile was already picked up, and there is nothing to do.
+    fn enter_released(&self) {
+        if !self.enter_down.replace(false) {
+            return;
+        }
+        if let Some(timer) = self.enter_timer.take() {
+            timer.remove();
+            if let Some((_, button)) = self.focused_tile() {
+                button.emit_clicked();
+            }
+        }
+    }
+
+    /// A click on a tile while one is picked up drops it, and while arranging picks the
+    /// tile up. True if the click was used for that, so it does not open the tile.
+    fn click_while_arranging(&self, page: &str, button: &gtk::Button) -> bool {
+        if self.picked.borrow().is_some() {
+            self.drop_picked();
+            return true;
+        }
+        if self.arranging.get() && self.arrangeable.borrow().contains_key(page) {
+            self.pick_up(page, button);
+            return true;
+        }
+        false
+    }
+
+    fn pick_up(&self, page: &str, button: &gtk::Button) {
+        let from = {
+            let arrangeable = self.arrangeable.borrow();
+            let Some(tiles) = arrangeable.get(page) else {
+                return;
+            };
+            children(&tiles.row)
+                .iter()
+                .position(|child| child == button.upcast_ref::<gtk::Widget>())
+        };
+        let Some(from) = from else {
+            return;
+        };
+        button.add_css_class("picked");
+        self.picked.replace(Some(Picked {
+            page: page.to_owned(),
+            button: button.clone(),
+            from,
+        }));
+        self.sounds.chosen();
+        self.update_arrange_hint();
+    }
+
+    /// Moves the picked tile one place along its row; it stays where it is at either end.
+    fn move_picked(&self, delta: isize) {
+        let picked = self.picked.borrow();
+        let arrangeable = self.arrangeable.borrow();
+        let Some((picked, tiles)) = picked
+            .as_ref()
+            .and_then(|picked| Some((picked, arrangeable.get(&picked.page)?)))
+        else {
+            return;
+        };
+        let row = children(&tiles.row);
+        let Some(position) = row
+            .iter()
+            .position(|c| c == picked.button.upcast_ref::<gtk::Widget>())
+        else {
+            return;
+        };
+        if let Some(target) = order::step(position, delta, row.len()) {
+            place(&tiles.row, &picked.button, target);
+            self.sounds.moved();
+        }
+    }
+
+    /// Puts the picked tile down where it is, and saves the order.
+    fn drop_picked(&self) {
+        let Some(picked) = self.picked.take() else {
+            return;
+        };
+        picked.button.remove_css_class("picked");
+        self.save_order(&picked.page);
+        self.refresh_first(&picked.page);
+        // Focus stays on the tile, which only changed places.
+        picked.button.grab_focus();
+        self.sounds.chosen();
+        self.update_arrange_hint();
+    }
+
+    /// Puts the picked tile back where it was picked up.
+    fn cancel_picked(&self) {
+        let Some(picked) = self.picked.take() else {
+            return;
+        };
+        picked.button.remove_css_class("picked");
+        if let Some(tiles) = self.arrangeable.borrow().get(&picked.page) {
+            place(&tiles.row, &picked.button, picked.from);
+        }
+        self.refresh_first(&picked.page);
+        picked.button.grab_focus();
+        self.sounds.chosen();
+        self.update_arrange_hint();
+    }
+
+    /// Ends everything the arranging keys started: a tile picked up goes back, the
+    /// arranging mode and a pending long press end.
+    fn stop_arranging(&self) {
+        self.cancel_picked();
+        self.arranging.set(false);
+        self.enter_down.set(false);
+        if let Some(timer) = self.enter_timer.take() {
+            timer.remove();
+        }
+        self.update_arrange_hint();
+    }
+
+    /// The tile order of the page, as the row shows it now.
+    fn save_order(&self, page: &str) {
+        let names: Vec<order::Identity> = {
+            let arrangeable = self.arrangeable.borrow();
+            let Some(tiles) = arrangeable.get(page) else {
+                return;
+            };
+            let configured: Vec<_> = (0..tiles.buttons.len())
+                .map(|index| self.tile(page, index).name.as_str())
+                .collect();
+            let identities = order::identities(&configured);
+            children(&tiles.row)
+                .iter()
+                .filter_map(|child| {
+                    tiles
+                        .buttons
+                        .iter()
+                        .position(|button| button.upcast_ref::<gtk::Widget>() == child)
+                })
+                .map(|index| identities[index].clone())
+                .collect()
+        };
+        let mut saved = self.saved_order.borrow_mut();
+        saved.insert(page.to_owned(), names);
+        order::save(&saved);
+    }
+
+    /// The first tile of a page is what is selected when it opens.
+    fn refresh_first(&self, page: &str) {
+        let first = self.arrangeable.borrow().get(page).and_then(|tiles| {
+            tiles
+                .row
+                .first_child()
+                .and_then(|child| child.downcast::<gtk::Button>().ok())
+        });
+        if let Some(first) = first {
+            self.first_tiles.borrow_mut().insert(page.to_owned(), first);
+        }
+    }
+
+    /// From the power menu: back to the main row, where Enter picks tiles up.
+    fn start_arranging(&self) {
+        self.main_row();
+        self.arranging.set(true);
+        self.update_arrange_hint();
+    }
+
+    /// Puts every row back in the configured order and forgets the saved one.
+    fn reset_order(&self) {
+        order::clear();
+        self.saved_order.borrow_mut().clear();
+        let pages: Vec<String> = self.arrangeable.borrow().keys().cloned().collect();
+        for page in &pages {
+            if let Some(tiles) = self.arrangeable.borrow().get(page) {
+                for (index, button) in tiles.buttons.iter().enumerate() {
+                    place(&tiles.row, button, index);
+                }
+            }
+            self.refresh_first(page);
+        }
+        self.main_row();
+        self.toasts.add_toast(adw::Toast::new("Tile order reset"));
+    }
+
+    fn update_arrange_hint(&self) {
+        let text = if self.picked.borrow().is_some() {
+            Some(PICKED_HINT)
+        } else if self.arranging.get() {
+            Some(ARRANGING_HINT)
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            self.arrange_hint.set_label(text);
+        }
+        self.arrange_hint.set_visible(text.is_some());
     }
 
     /// Sizes every row's tiles to fit a window `width` logical pixels wide, so the
@@ -574,12 +951,22 @@ impl Ui {
                 self.desktop_mode();
                 Ok(())
             }
-            Action::Builtin(builtin @ (Builtin::Shutdown | Builtin::Restart)) if !confirming => {
+            Action::Builtin(
+                builtin @ (Builtin::Shutdown | Builtin::Restart | Builtin::ResetOrder),
+            ) if !confirming => {
                 self.open(&confirm_page(*builtin), button);
                 Ok(())
             }
             Action::Builtin(Builtin::Shutdown) => self.power(tile, "poweroff"),
             Action::Builtin(Builtin::Restart) => self.power(tile, "reboot"),
+            Action::Builtin(Builtin::Arrange) => {
+                self.start_arranging();
+                Ok(())
+            }
+            Action::Builtin(Builtin::ResetOrder) => {
+                self.reset_order();
+                Ok(())
+            }
             Action::Builtin(Builtin::Cancel) => {
                 self.back();
                 Ok(())
@@ -772,6 +1159,31 @@ impl Ui {
     }
 }
 
+/// The children of `row`, left to right.
+fn children(row: &gtk::Box) -> Vec<gtk::Widget> {
+    let mut children = Vec::new();
+    let mut child = row.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        children.push(widget);
+    }
+    children
+}
+
+/// Moves `button` to `index` in `row`, the others keeping their order.
+fn place(row: &gtk::Box, button: &gtk::Button, index: usize) {
+    let others: Vec<_> = children(row)
+        .into_iter()
+        .filter(|child| child != button.upcast_ref::<gtk::Widget>())
+        .collect();
+    row.reorder_child_after(button, index.checked_sub(1).and_then(|i| others.get(i)));
+}
+
+fn is_enter(key: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+    matches!(key, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+}
+
 /// Keys that move the selection from tile to tile.
 fn is_navigation(key: gtk::gdk::Key) -> bool {
     use gtk::gdk::Key;
@@ -832,6 +1244,18 @@ fn own_pages() -> Vec<OwnPage> {
                     Builtin::DesktopMode,
                 ),
                 builtin_tile(
+                    "Arrange Tiles",
+                    "view-list-symbolic",
+                    "Pick tiles up and move them",
+                    Builtin::Arrange,
+                ),
+                builtin_tile(
+                    "Reset Tile Order",
+                    "edit-undo-symbolic",
+                    "Put the tiles back in the configured order",
+                    Builtin::ResetOrder,
+                ),
+                builtin_tile(
                     "Restart",
                     "system-reboot-symbolic",
                     "Restart the HTPC",
@@ -842,6 +1266,19 @@ fn own_pages() -> Vec<OwnPage> {
                     "system-shutdown-symbolic",
                     "Turn the HTPC off",
                     Builtin::Shutdown,
+                ),
+            ],
+        },
+        OwnPage {
+            key: "confirm:reset",
+            title: "Reset tile order?",
+            tiles: vec![
+                cancel(),
+                builtin_tile(
+                    "Reset",
+                    "edit-undo-symbolic",
+                    "Use the configured tile order again",
+                    Builtin::ResetOrder,
                 ),
             ],
         },
@@ -874,10 +1311,12 @@ fn own_pages() -> Vec<OwnPage> {
     ]
 }
 
-/// The page asking whether to go ahead with `builtin`, a shutdown or restart.
+/// The page asking whether to go ahead with `builtin`: a shutdown, restart or reset of
+/// the tile order.
 fn confirm_page(builtin: Builtin) -> String {
     let action = match builtin {
         Builtin::Restart => "restart",
+        Builtin::ResetOrder => "reset",
         _ => "shutdown",
     };
     format!("{CONFIRM_PREFIX}{action}")
@@ -992,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn the_power_menu_offers_desktop_mode_restart_and_shutdown() {
+    fn the_power_menu_offers_desktop_mode_arranging_reset_restart_and_shutdown() {
         let pages = own_pages();
         let power = pages
             .iter()
@@ -1003,6 +1442,8 @@ mod tests {
             actions,
             [
                 &Action::Builtin(Builtin::DesktopMode),
+                &Action::Builtin(Builtin::Arrange),
+                &Action::Builtin(Builtin::ResetOrder),
                 &Action::Builtin(Builtin::Restart),
                 &Action::Builtin(Builtin::Shutdown),
             ]
@@ -1010,9 +1451,9 @@ mod tests {
     }
 
     #[test]
-    fn every_power_off_action_has_a_confirmation_that_selects_cancel_first() {
+    fn every_power_off_or_reset_action_has_a_confirmation_that_selects_cancel_first() {
         let pages = own_pages();
-        for builtin in [Builtin::Shutdown, Builtin::Restart] {
+        for builtin in [Builtin::Shutdown, Builtin::Restart, Builtin::ResetOrder] {
             let key = confirm_page(builtin);
             assert!(key.starts_with(CONFIRM_PREFIX));
             let page = pages.iter().find(|page| page.key == key).unwrap();

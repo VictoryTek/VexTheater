@@ -55,10 +55,32 @@ on screen.
 
 The round power button beside the clock is part of the launcher, not of the
 configuration: press Up from the tile row to select it (Down goes back to the tiles) and
-Enter, or click it, to open the power menu with Desktop Mode, Restart and Shutdown. Esc
-leaves the menu. Restart and Shutdown ask for confirmation first, with Cancel selected,
-so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in a
-submenu of the configuration ask the same way.
+Enter, or click it, to open the power menu with Desktop Mode, Arrange Tiles, Reset Tile
+Order, Restart and Shutdown. Esc leaves the menu. Restart, Shutdown and Reset Tile Order
+ask for confirmation first, with Cancel selected, so a stray key press cannot power the
+machine off. Tiles with a `shutdown` or `restart` builtin in a submenu of the
+configuration ask the same way.
+
+### Arranging tiles
+
+The tiles of the main row and of the configured submenus can be reordered from the
+launcher (the power menu cannot). Pick a tile up by holding Enter on it, or pressing Menu
+or F2; or choose Arrange Tiles in the power menu, after which Enter picks up the selected
+tile. A picked-up tile is lifted and ringed, ← → move it one place (it stops at the ends),
+Enter drops it, and Back cancels and puts it back. Back leaves Arrange Tiles. After a
+drop, the selection stays on the tile.
+
+A remote cannot hold a key: the HDMI-CEC bridge in vexos-nix presses and releases at once,
+and sends no Menu or F2. Use Arrange Tiles from the power menu there (main row only).
+
+The order is saved per page in `$XDG_STATE_HOME/vextheater/order.json`
+(`~/.local/state/vextheater/`), on top of the configuration: a tile added to the
+configuration later goes last, and a removed one is dropped from the saved order. Tiles
+are identified by name; tiles on one page that share a name are told apart by their place
+among them in the configuration (the first "Browser", the second "Browser"), so each
+keeps its own position. Adding or removing an earlier tile of the same name in the
+configuration shifts the later ones. Reset Tile Order deletes the file and returns every
+row to the configured order.
 
 **Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
 vexos-nix HTPC module sent them). The button replaces them, so the launcher leaves out of

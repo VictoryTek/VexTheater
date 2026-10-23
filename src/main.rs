@@ -6,6 +6,7 @@ mod files;
 mod gnome;
 mod launch;
 mod mode;
+mod order;
 mod sound;
 mod window;
 

@@ -92,6 +92,24 @@ button.tile:focus:active {
   transform: translateY(-12px) scale(1.06);
 }
 
+/* A tile picked up for moving: lifted higher than a selected one, with a solid ring. */
+button.tile.picked:focus {
+  background-color: var(--accent-bg-color);
+  transform: translateY(-28px) scale(1.2);
+  box-shadow: 0 0 0 4px #ffffff, 0 40px 70px rgba(0, 0, 0, 0.7);
+}
+
+/* What the keys do while a tile is picked up or tiles are being arranged. */
+.arrange-hint {
+  font-size: 22px;
+  font-weight: 600;
+  padding: 10px 28px;
+  border-radius: 999px;
+  color: #ffffff;
+  background-color: rgba(0, 0, 0, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+
 /* ── Power button ─────────────────────────────────────────────────────────────
    Top-right, beside the clock. Its focus ring has to read from the couch: a solid
    accent fill, a white ring and a lift, rather than the subtle tile highlight. */

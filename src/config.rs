@@ -66,6 +66,12 @@ pub enum Builtin {
     /// configuration cannot ask for it.
     #[serde(skip_deserializing)]
     Cancel,
+    /// Lets the user pick tiles up and move them. Only the power menu uses it.
+    #[serde(skip_deserializing)]
+    Arrange,
+    /// Puts the tiles back in the configured order. Only the power menu uses it.
+    #[serde(skip_deserializing)]
+    ResetOrder,
 }
 
 impl Tile {
@@ -209,6 +215,16 @@ mod tests {
     fn a_configuration_cannot_use_the_launchers_own_cancel() {
         let text = r#"{ "tiles": [ { "name": "A", "icon": "a", "builtin": "cancel" } ] }"#;
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn a_configuration_cannot_use_the_launchers_own_arrange_or_reset() {
+        for builtin in ["arrange", "reset-order"] {
+            let text = format!(
+                r#"{{ "tiles": [ {{ "name": "A", "icon": "a", "builtin": "{builtin}" }} ] }}"#
+            );
+            assert!(Config::parse(&text).is_err(), "{builtin}");
+        }
     }
 
     #[test]
