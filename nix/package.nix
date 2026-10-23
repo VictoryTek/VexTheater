@@ -6,6 +6,7 @@
 , gtk4
 , libadwaita
 , hicolor-icon-theme
+, gst_all_1
 }:
 
 rustPlatform.buildRustPackage {
@@ -29,6 +30,11 @@ rustPlatform.buildRustPackage {
     gtk4
     libadwaita
     hicolor-icon-theme
+    # The click sounds: GTK plays them through GStreamer. -base has the player and
+    # audio conversion, -good the WAV parser and the output to PipeWire's PulseAudio
+    # server; wrapGAppsHook4 puts their plugin directories on the wrapper's path.
+    gst_all_1.gst-plugins-base
+    gst_all_1.gst-plugins-good
   ];
 
   # wrapGAppsHook4 bakes XDG_DATA_DIRS from buildInputs into the wrapper but does not

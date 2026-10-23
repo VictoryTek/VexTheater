@@ -31,6 +31,8 @@
             gtk4
             libadwaita
             glib
+            gst_all_1.gst-plugins-base  # the click sounds play through GStreamer
+            gst_all_1.gst-plugins-good
           ];
         };
 

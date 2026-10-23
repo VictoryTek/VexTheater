@@ -3,6 +3,8 @@
   <gresource prefix="/io/github/vextheater">
     <file alias="style.css">style.css</file>
     <file alias="vexos-logo.png">vexos-logo.png</file>
+    <file alias="sounds/move.wav">sounds/move.wav</file>
+    <file alias="sounds/select.wav">sounds/select.wav</file>
     <file alias="icons/hicolor/512x512/apps/io.github.vextheater.png">icons/hicolor/512x512/apps/io.github.vextheater.png</file>
   </gresource>
 </gresources>

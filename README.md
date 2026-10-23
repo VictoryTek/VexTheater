@@ -71,6 +71,11 @@ launcher uses a plain dark gradient.
 
 ## Behaviour
 
+- Moving between tiles, by key or by the pointer, plays a short tick, and choosing a
+  tile, opening the power menu or going back plays a click, like a streaming box. The
+  sounds are bundled (`data/sounds/`, written by `scripts/make-sounds.py`) and play
+  through GStreamer to the default audio output; with no audio output the launcher stays
+  silent and logs a warning.
 - An ordinary tile app runs in its own systemd user scope; a Flatpak app is started
   directly, because Flatpak moves it into a scope of its own, and the launcher records
   that one instance (its process id and start time) in

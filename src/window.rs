@@ -5,6 +5,7 @@
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
 use crate::mode::{self, Mode};
+use crate::sound::Sounds;
 use crate::{gnome, launch};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -180,6 +181,10 @@ struct Ui {
     /// Hover selects a tile only while the pointer is shown, so a tile moving under a
     /// hidden pointer cannot steal the keyboard's selection.
     pointer_visible: Cell<bool>,
+    sounds: Sounds,
+    /// A navigation key or the pointer is moving the selection. Selection also moves
+    /// when a page opens or the window is shown again, and those stay silent.
+    navigating: Cell<bool>,
     clock: Clock,
 }
 
@@ -265,6 +270,8 @@ impl Ui {
             rows: RefCell::default(),
             history: RefCell::default(),
             pointer_visible: Cell::new(false),
+            sounds: Sounds::new(),
+            navigating: Cell::new(false),
             clock,
         });
 
@@ -279,7 +286,10 @@ impl Ui {
 
         power_button.connect_clicked({
             let ui = ui.clone();
-            move |button| ui.open(POWER_PAGE, button)
+            move |button| {
+                ui.sounds.chosen();
+                ui.open(POWER_PAGE, button);
+            }
         });
         // The power button belongs to the main row only.
         ui.stack.connect_visible_child_name_notify({
@@ -297,11 +307,13 @@ impl Ui {
             let ui = ui.clone();
             move |_, key, _, _| match key {
                 gtk::gdk::Key::Escape | gtk::gdk::Key::BackSpace if ui.back() => {
+                    ui.sounds.chosen();
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Up if ui.on_main_page() && !power_button.is_focus() => {
                     last_tile.replace(GtkWindowExt::focus(&ui.window));
                     power_button.grab_focus();
+                    ui.sounds.moved();
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Down if power_button.is_focus() => {
@@ -315,6 +327,23 @@ impl Ui {
             }
         });
         window.add_controller(keys);
+
+        // Before the keys above and GTK's own handling move the selection, mark that
+        // a key is moving it; the mark ends once the key press is dealt with.
+        let navigation = gtk::EventControllerKey::new();
+        navigation.set_propagation_phase(gtk::PropagationPhase::Capture);
+        navigation.connect_key_pressed({
+            let ui = ui.clone();
+            move |_, key, _, _| {
+                if is_navigation(key) {
+                    ui.navigating.set(true);
+                    let ui = ui.clone();
+                    glib::idle_add_local_once(move || ui.navigating.set(false));
+                }
+                glib::Propagation::Proceed
+            }
+        });
+        window.add_controller(navigation);
 
         // The window is as wide as the screen, whatever its resolution: the tiles are
         // sized to that once the compositor reports it.
@@ -413,7 +442,12 @@ impl Ui {
             focus.connect_enter({
                 let (name, description) = (name.clone(), description.clone());
                 let (ui, page, index) = (self.clone(), page.to_owned(), index);
-                move |_| show_selected(&name, &description, ui.tile(&page, index))
+                move |_| {
+                    show_selected(&name, &description, ui.tile(&page, index));
+                    if ui.navigating.get() {
+                        ui.sounds.moved();
+                    }
+                }
             });
             button.add_controller(focus);
 
@@ -422,7 +456,9 @@ impl Ui {
                 let (ui, button) = (self.clone(), button.downgrade());
                 move |_, _, _| {
                     if let Some(button) = button.upgrade().filter(|_| ui.pointer_visible.get()) {
+                        ui.navigating.set(true);
                         button.grab_focus();
+                        ui.navigating.set(false);
                     }
                 }
             });
@@ -430,7 +466,10 @@ impl Ui {
 
             button.connect_clicked({
                 let (ui, page) = (self.clone(), page.to_owned());
-                move |button| ui.activate(&page, ui.tile(&page, index), button)
+                move |button| {
+                    ui.sounds.chosen();
+                    ui.activate(&page, ui.tile(&page, index), button);
+                }
             });
 
             row.append(&button);
@@ -733,6 +772,15 @@ impl Ui {
     }
 }
 
+/// Keys that move the selection from tile to tile.
+fn is_navigation(key: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+    matches!(
+        key,
+        Key::Left | Key::Right | Key::Up | Key::Down | Key::Tab | Key::ISO_Left_Tab
+    )
+}
+
 /// The side of a square tile for a row of `count` tiles in a window `width` wide:
 /// [`TILE_MAX`] if the row fits, else smaller, down to [`TILE_MIN`].
 fn tile_size(width: i32, count: usize) -> i32 {
@@ -894,9 +942,21 @@ fn hint(key: &str, action: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_page, own_pages, tile_size, CloseQueue, CONFIRM_PREFIX, TILE_MAX, TILE_MIN,
+        confirm_page, is_navigation, own_pages, tile_size, CloseQueue, CONFIRM_PREFIX, TILE_MAX,
+        TILE_MIN,
     };
     use crate::config::{Action, Builtin};
+    use gtk::gdk::Key;
+
+    #[test]
+    fn only_the_keys_that_move_the_selection_are_navigation() {
+        for key in [Key::Left, Key::Right, Key::Up, Key::Down, Key::Tab] {
+            assert!(is_navigation(key));
+        }
+        for key in [Key::Return, Key::Escape, Key::BackSpace, Key::F10] {
+            assert!(!is_navigation(key));
+        }
+    }
 
     #[test]
     fn tiles_keep_full_size_on_a_wide_screen() {
