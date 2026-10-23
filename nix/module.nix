@@ -33,10 +33,6 @@ in
           background = ./wallpaper.jpg;
           tiles = [
             { name = "Files"; icon = "org.gnome.Nautilus"; desktop = "org.gnome.Nautilus.desktop"; }
-            { name = "Power"; icon = "system-shutdown-symbolic"; submenu = "Power"; }
-          ];
-          submenus.Power = [
-            { name = "Shutdown"; icon = "system-shutdown-symbolic"; builtin = "shutdown"; }
           ];
         }
       '';

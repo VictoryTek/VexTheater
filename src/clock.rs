@@ -1,4 +1,4 @@
-//! The time and date in the top-right corner, and the greeting on the main row.
+//! The time and date for the top-right corner, and the greeting on the main row.
 
 use crate::window::label;
 use gtk::prelude::*;
@@ -16,10 +16,6 @@ impl Clock {
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::Start)
-            .margin_top(64)
-            .margin_end(96)
             .can_target(false)
             .build();
         let time = label("clock");

@@ -13,6 +13,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const MAIN_PAGE: &str = "main";
+const POWER_PAGE: &str = "power";
+const CONFIRM_PREFIX: &str = "confirm:";
 const PAGE_MARGIN: i32 = 96;
 const TILE_SPACING: i32 = 40;
 /// Tiles are this big when the screen has room, and shrink to fit the row on it.
@@ -167,6 +169,8 @@ struct Ui {
     /// Serialises closes; see `close_then`.
     closes: CloseQueue<Request>,
     stack: gtk::Stack,
+    /// Pages the launcher adds itself, beside the configured ones.
+    own_pages: Vec<OwnPage>,
     /// First tile of each page, focused when the page opens.
     first_tiles: RefCell<HashMap<String, gtk::Button>>,
     /// The row of tiles on each page, resized to the window by `fit_tiles`.
@@ -211,20 +215,39 @@ impl Ui {
         overlay.add_overlay(&stack);
 
         let clock = Clock::new();
-        overlay.add_overlay(&clock.widget);
+        let power_button = power_button();
+        let corner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(40)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .margin_top(64)
+            .margin_end(PAGE_MARGIN)
+            .build();
+        corner.append(&power_button);
+        corner.append(&clock.widget);
+        overlay.add_overlay(&corner);
 
         // Bottom-right, clear of the tile row and the key hints, like GNOME's
-        // background logo.
-        let logo = gtk::Picture::for_resource("/io/github/vextheater/vexos-logo.png");
-        logo.add_css_class("vexos-logo");
-        logo.set_content_fit(gtk::ContentFit::Contain);
-        logo.set_can_shrink(true);
-        logo.set_size_request(LOGO_WIDTH, LOGO_WIDTH * 164 / 437);
-        logo.set_halign(gtk::Align::End);
-        logo.set_valign(gtk::Align::End);
-        logo.set_margin_end(96);
-        logo.set_margin_bottom(52);
-        logo.set_can_target(false);
+        // background logo. A picture is as wide as its image whatever size is
+        // requested, so it sits in a window that has the size and no scroll bars.
+        let logo_picture = gtk::Picture::for_resource("/io/github/vextheater/vexos-logo.png");
+        logo_picture.set_content_fit(gtk::ContentFit::Contain);
+        logo_picture.set_can_shrink(true);
+        let logo = gtk::ScrolledWindow::builder()
+            .child(&logo_picture)
+            .hscrollbar_policy(gtk::PolicyType::External)
+            .vscrollbar_policy(gtk::PolicyType::External)
+            .min_content_width(LOGO_WIDTH)
+            .min_content_height(LOGO_WIDTH * 164 / 437)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(PAGE_MARGIN)
+            .margin_bottom(52)
+            .can_target(false)
+            .focusable(false)
+            .css_classes(["vexos-logo"])
+            .build();
         overlay.add_overlay(&logo);
 
         let toasts = adw::ToastOverlay::new();
@@ -237,6 +260,7 @@ impl Ui {
             running: RefCell::default(),
             closes: CloseQueue::new(),
             stack,
+            own_pages: own_pages(),
             first_tiles: RefCell::default(),
             rows: RefCell::default(),
             history: RefCell::default(),
@@ -248,13 +272,43 @@ impl Ui {
         for (name, tiles) in &ui.config.submenus {
             ui.add_page(&submenu_page(name), Some(name), tiles);
         }
+        for page in &ui.own_pages {
+            ui.add_page(page.key, Some(page.title), &page.tiles);
+        }
         ui.clock.start();
 
+        power_button.connect_clicked({
+            let ui = ui.clone();
+            move |button| ui.open(POWER_PAGE, button)
+        });
+        // The power button belongs to the main row only.
+        ui.stack.connect_visible_child_name_notify({
+            let power_button = power_button.clone();
+            move |stack| {
+                power_button.set_visible(stack.visible_child_name().as_deref() == Some(MAIN_PAGE));
+            }
+        });
+
+        // GTK's arrow keys do not reach the button from the tiles, so Up and Down
+        // cross between them here. Down goes back to the tile Up left.
         let keys = gtk::EventControllerKey::new();
+        let last_tile: Rc<RefCell<Option<gtk::Widget>>> = Rc::default();
         keys.connect_key_pressed({
             let ui = ui.clone();
             move |_, key, _, _| match key {
                 gtk::gdk::Key::Escape | gtk::gdk::Key::BackSpace if ui.back() => {
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::Up if ui.on_main_page() && !power_button.is_focus() => {
+                    last_tile.replace(GtkWindowExt::focus(&ui.window));
+                    power_button.grab_focus();
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::Down if power_button.is_focus() => {
+                    let first = ui.first_tiles.borrow().get(MAIN_PAGE).cloned();
+                    if let Some(tile) = last_tile.take().or(first.map(Cast::upcast)) {
+                        tile.grab_focus();
+                    }
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
@@ -293,17 +347,28 @@ impl Ui {
     /// and returns to the main row.
     fn home(self: &Rc<Self>) {
         self.close_then(Request::Home);
-        while self.back() {}
+        self.main_row();
         self.show();
     }
 
     /// Hides the launcher. A tile or home chosen during a close that is still running
     /// is cancelled, so no app starts over the desktop once it finishes.
     fn desktop_mode(&self) {
+        // Back on the main row when the launcher comes back, not in the power menu.
+        self.main_row();
         self.closes.cancel();
         mode::save(Mode::Desktop);
         gnome::restore();
         self.window.set_visible(false);
+    }
+
+    /// Leaves every submenu and selects the first tile, not the power button a
+    /// submenu may have been opened from.
+    fn main_row(&self) {
+        while self.back() {}
+        if let Some(first) = self.first_tiles.borrow().get(MAIN_PAGE) {
+            first.grab_focus();
+        }
     }
 
     /// One row of tiles with its header, selected-tile title and key hints.
@@ -365,7 +430,7 @@ impl Ui {
 
             button.connect_clicked({
                 let (ui, page) = (self.clone(), page.to_owned());
-                move |button| ui.activate(ui.tile(&page, index), button)
+                move |button| ui.activate(&page, ui.tile(&page, index), button)
             });
 
             row.append(&button);
@@ -449,12 +514,18 @@ impl Ui {
     fn tile(&self, page: &str, index: usize) -> &Tile {
         let tiles = match page.strip_prefix("submenu:") {
             Some(name) => &self.config.submenus[name],
-            None => &self.config.tiles,
+            None => match self.own_pages.iter().find(|own| own.key == page) {
+                Some(own) => &own.tiles,
+                None => &self.config.tiles,
+            },
         };
         &tiles[index]
     }
 
-    fn activate(self: &Rc<Self>, tile: &Tile, button: &gtk::Button) {
+    /// `page` is the page the tile is on: a shutdown or restart asks for
+    /// confirmation first, so a stray key press cannot power the machine off.
+    fn activate(self: &Rc<Self>, page: &str, tile: &Tile, button: &gtk::Button) {
+        let confirming = page.starts_with(CONFIRM_PREFIX);
         let result = match &tile.action {
             Action::Submenu(name) => {
                 self.open(&submenu_page(name), button);
@@ -464,8 +535,16 @@ impl Ui {
                 self.desktop_mode();
                 Ok(())
             }
+            Action::Builtin(builtin @ (Builtin::Shutdown | Builtin::Restart)) if !confirming => {
+                self.open(&confirm_page(*builtin), button);
+                Ok(())
+            }
             Action::Builtin(Builtin::Shutdown) => self.power(tile, "poweroff"),
             Action::Builtin(Builtin::Restart) => self.power(tile, "reboot"),
+            Action::Builtin(Builtin::Cancel) => {
+                self.back();
+                Ok(())
+            }
             action => {
                 self.launch(tile, action);
                 Ok(())
@@ -603,6 +682,10 @@ impl Ui {
         }
     }
 
+    fn on_main_page(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some(MAIN_PAGE)
+    }
+
     /// Returns to the page this submenu was opened from; false on the main page.
     fn back(&self) -> bool {
         let Some((page, opener)) = self.history.borrow_mut().pop() else {
@@ -662,6 +745,110 @@ fn submenu_page(name: &str) -> String {
     format!("submenu:{name}")
 }
 
+/// A page the launcher adds itself: the power menu and its confirmations.
+struct OwnPage {
+    key: &'static str,
+    title: &'static str,
+    tiles: Vec<Tile>,
+}
+
+fn builtin_tile(name: &str, icon: &str, description: &str, builtin: Builtin) -> Tile {
+    Tile {
+        name: name.to_owned(),
+        icon: icon.to_owned(),
+        description: Some(description.to_owned()),
+        action: Action::Builtin(builtin),
+    }
+}
+
+/// The power menu, and a confirmation for each of its actions that powers the machine
+/// off. Cancel comes first, so it is what is selected when a confirmation opens.
+fn own_pages() -> Vec<OwnPage> {
+    let cancel = || {
+        builtin_tile(
+            "Cancel",
+            "window-close-symbolic",
+            "Go back",
+            Builtin::Cancel,
+        )
+    };
+    vec![
+        OwnPage {
+            key: POWER_PAGE,
+            title: "Power",
+            tiles: vec![
+                builtin_tile(
+                    "Desktop Mode",
+                    "user-desktop",
+                    "Hide the launcher and show the GNOME desktop",
+                    Builtin::DesktopMode,
+                ),
+                builtin_tile(
+                    "Restart",
+                    "system-reboot-symbolic",
+                    "Restart the HTPC",
+                    Builtin::Restart,
+                ),
+                builtin_tile(
+                    "Shutdown",
+                    "system-shutdown-symbolic",
+                    "Turn the HTPC off",
+                    Builtin::Shutdown,
+                ),
+            ],
+        },
+        OwnPage {
+            key: "confirm:shutdown",
+            title: "Shut down?",
+            tiles: vec![
+                cancel(),
+                builtin_tile(
+                    "Shut down",
+                    "system-shutdown-symbolic",
+                    "Turn the HTPC off now",
+                    Builtin::Shutdown,
+                ),
+            ],
+        },
+        OwnPage {
+            key: "confirm:restart",
+            title: "Restart?",
+            tiles: vec![
+                cancel(),
+                builtin_tile(
+                    "Restart",
+                    "system-reboot-symbolic",
+                    "Restart the HTPC now",
+                    Builtin::Restart,
+                ),
+            ],
+        },
+    ]
+}
+
+/// The page asking whether to go ahead with `builtin`, a shutdown or restart.
+fn confirm_page(builtin: Builtin) -> String {
+    let action = match builtin {
+        Builtin::Restart => "restart",
+        _ => "shutdown",
+    };
+    format!("{CONFIRM_PREFIX}{action}")
+}
+
+/// Top-right, next to the clock: the way into the power menu.
+fn power_button() -> gtk::Button {
+    let icon = gtk::Image::from_icon_name("system-shutdown-symbolic");
+    icon.set_pixel_size(32);
+    let button = gtk::Button::builder()
+        .child(&icon)
+        .css_classes(["power-button"])
+        .valign(gtk::Align::Start)
+        .margin_top(8)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("Power")]);
+    button
+}
+
 fn tile_button(tile: &Tile) -> gtk::Button {
     let icon = if tile.icon_is_file() {
         gtk::Image::from_gicon(&gio::FileIcon::new(&gio::File::for_path(&tile.icon)))
@@ -706,7 +893,10 @@ fn hint(key: &str, action: &str) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
-    use super::{tile_size, CloseQueue, TILE_MAX, TILE_MIN};
+    use super::{
+        confirm_page, own_pages, tile_size, CloseQueue, CONFIRM_PREFIX, TILE_MAX, TILE_MIN,
+    };
+    use crate::config::{Action, Builtin};
 
     #[test]
     fn tiles_keep_full_size_on_a_wide_screen() {
@@ -739,6 +929,37 @@ mod tests {
         assert_eq!(queue.finish(), Some("kodi"));
         assert_eq!(queue.finish(), None, "a request is acted on once");
         assert!(queue.submit("brave"), "the next pick starts a new close");
+    }
+
+    #[test]
+    fn the_power_menu_offers_desktop_mode_restart_and_shutdown() {
+        let pages = own_pages();
+        let power = pages
+            .iter()
+            .find(|page| page.key == super::POWER_PAGE)
+            .unwrap();
+        let actions: Vec<_> = power.tiles.iter().map(|tile| &tile.action).collect();
+        assert_eq!(
+            actions,
+            [
+                &Action::Builtin(Builtin::DesktopMode),
+                &Action::Builtin(Builtin::Restart),
+                &Action::Builtin(Builtin::Shutdown),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_power_off_action_has_a_confirmation_that_selects_cancel_first() {
+        let pages = own_pages();
+        for builtin in [Builtin::Shutdown, Builtin::Restart] {
+            let key = confirm_page(builtin);
+            assert!(key.starts_with(CONFIRM_PREFIX));
+            let page = pages.iter().find(|page| page.key == key).unwrap();
+            assert_eq!(page.tiles[0].action, Action::Builtin(Builtin::Cancel));
+            assert_eq!(page.tiles[1].action, Action::Builtin(builtin));
+            assert_eq!(page.tiles.len(), 2);
+        }
     }
 
     #[test]

@@ -37,23 +37,33 @@ programs.vextheater = {
     { "name": "YouTube", "icon": "/path/to/youtube.svg", "description": "YouTube TV interface, full screen",
       "command": "brave --kiosk --app=https://youtube.com/tv" },
     { "name": "Files",   "icon": "org.gnome.Nautilus",   "desktop": "org.gnome.Nautilus.desktop" },
-    { "name": "FreeTube","icon": "io.freetubeapp.FreeTube", "flatpak": "io.freetubeapp.FreeTube" },
-    { "name": "Desktop", "icon": "user-desktop",         "builtin": "desktop-mode" },
-    { "name": "Power",   "icon": "system-shutdown-symbolic", "submenu": "Power" }
-  ],
-  "submenus": {
-    "Power": [
-      { "name": "Shutdown", "icon": "system-shutdown-symbolic", "builtin": "shutdown" },
-      { "name": "Restart",  "icon": "system-reboot-symbolic",   "builtin": "restart" }
-    ]
-  }
+    { "name": "FreeTube","icon": "io.freetubeapp.FreeTube", "flatpak": "io.freetubeapp.FreeTube" }
+  ]
 }
 ```
 
 Each tile has a `name`, an `icon` (an icon-theme name, or an absolute path to an
 image), an optional one-line `description` shown while it is selected, and exactly
 one action: `command`, `desktop`, `flatpak`, `submenu` or `builtin`
-(`desktop-mode`, `shutdown`, `restart`).
+(`desktop-mode`, `shutdown`, `restart`). A `submenu` names an entry in the optional
+`"submenus"` object, which maps a name to a list of tiles like `tiles`.
+
+Tiles shrink from 200 px to fit the row on a narrow screen, so a row of any length stays
+on screen.
+
+### Power menu
+
+The round power button beside the clock is part of the launcher, not of the
+configuration: press Up from the tile row to select it (Down goes back to the tiles) and
+Enter, or click it, to open the power menu with Desktop Mode, Restart and Shutdown. Esc
+leaves the menu. Restart and Shutdown ask for confirmation first, with Cancel selected,
+so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in the configuration ask the
+same way.
+
+**Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
+vexos-nix HTPC module sent them). A configuration that still sends them keeps working, but
+they are then shown twice, as tiles and in the power menu. Remove them from the
+configuration to avoid that.
 
 All top-level keys are optional. `title` is shown under the greeting, `homeKey` names
 the key that closes the open app in the key hints, and without `background` the
@@ -122,8 +132,8 @@ launcher uses a plain dark gradient.
     the journal, as `vextheater`) that the one-process-id assumption does not hold on
     this system. Older instances of the same app (a stuck earlier one, or one opened
     from the desktop earlier) are ignored.
-- Desktop mode hides the launcher; running `vextheater` again (e.g. "Theater Mode" in
-  the app grid) shows it.
+- Desktop mode (in the power menu) hides the launcher; running `vextheater` again
+  (e.g. "Theater Mode" in the app grid) shows it.
 - With `autostart`, the launcher runs as the `vextheater --resume` systemd user
   service, part of the graphical session and restarted if it crashes. The current mode
   is kept in `$XDG_RUNTIME_DIR/vextheater/mode`, so a launcher restarted after a crash

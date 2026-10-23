@@ -62,6 +62,10 @@ pub enum Builtin {
     DesktopMode,
     Shutdown,
     Restart,
+    /// Leaves a confirmation page. Only the launcher's own pages use it: a
+    /// configuration cannot ask for it.
+    #[serde(skip_deserializing)]
+    Cancel,
 }
 
 impl Tile {
@@ -171,6 +175,12 @@ mod tests {
     #[test]
     fn rejects_an_unknown_builtin() {
         let text = r#"{ "tiles": [ { "name": "A", "icon": "a", "builtin": "sleep" } ] }"#;
+        assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn a_configuration_cannot_use_the_launchers_own_cancel() {
+        let text = r#"{ "tiles": [ { "name": "A", "icon": "a", "builtin": "cancel" } ] }"#;
         assert!(Config::parse(text).is_err());
     }
 
