@@ -779,7 +779,7 @@ fn own_pages() -> Vec<OwnPage> {
             tiles: vec![
                 builtin_tile(
                     "Desktop Mode",
-                    "user-desktop",
+                    "video-display-symbolic",
                     "Hide the launcher and show the GNOME desktop",
                     Builtin::DesktopMode,
                 ),

@@ -87,7 +87,19 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("invalid configuration in {}", path.display()))
+        let mut config = Self::parse(&text)
+            .with_context(|| format!("invalid configuration in {}", path.display()))?;
+        config.drop_power_tiles();
+        Ok(config)
+    }
+
+    /// The power button beside the clock replaces the Desktop Mode, Restart and Shutdown
+    /// tiles, and a tile opening a submenu of only those (the old "Power" tile). A
+    /// configuration that still sends them, as the vexos-nix HTPC module used to, would
+    /// show them twice.
+    fn drop_power_tiles(&mut self) {
+        let submenus = &self.submenus;
+        self.tiles.retain(|tile| !is_power_tile(tile, submenus));
     }
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
@@ -107,6 +119,21 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+fn is_power_tile(tile: &Tile, submenus: &BTreeMap<String, Vec<Tile>>) -> bool {
+    let is_power_builtin = |tile: &Tile| {
+        matches!(
+            tile.action,
+            Action::Builtin(Builtin::DesktopMode | Builtin::Shutdown | Builtin::Restart)
+        )
+    };
+    match &tile.action {
+        Action::Submenu(name) => submenus
+            .get(name)
+            .is_some_and(|tiles| !tiles.is_empty() && tiles.iter().all(is_power_builtin)),
+        _ => is_power_builtin(tile),
     }
 }
 
@@ -182,6 +209,38 @@ mod tests {
     fn a_configuration_cannot_use_the_launchers_own_cancel() {
         let text = r#"{ "tiles": [ { "name": "A", "icon": "a", "builtin": "cancel" } ] }"#;
         assert!(Config::parse(text).is_err());
+    }
+
+    #[test]
+    fn the_power_button_replaces_configured_power_tiles() {
+        let mut config = Config::parse(
+            r#"{
+                "tiles": [
+                    { "name": "Files", "icon": "f", "desktop": "org.gnome.Nautilus.desktop" },
+                    { "name": "Desktop", "icon": "d", "builtin": "desktop-mode" },
+                    { "name": "Restart", "icon": "r", "builtin": "restart" },
+                    { "name": "Power", "icon": "p", "submenu": "Power" },
+                    { "name": "System", "icon": "s", "submenu": "System" },
+                    { "name": "Empty", "icon": "e", "submenu": "Empty" }
+                ],
+                "submenus": {
+                    "Power": [
+                        { "name": "Shutdown", "icon": "s", "builtin": "shutdown" },
+                        { "name": "Restart", "icon": "r", "builtin": "restart" }
+                    ],
+                    "System": [
+                        { "name": "Shutdown", "icon": "s", "builtin": "shutdown" },
+                        { "name": "Settings", "icon": "g", "desktop": "org.gnome.Settings.desktop" }
+                    ],
+                    "Empty": []
+                }
+            }"#,
+        )
+        .unwrap();
+        config.drop_power_tiles();
+
+        let names: Vec<_> = config.tiles.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Files", "System", "Empty"]);
     }
 
     #[test]

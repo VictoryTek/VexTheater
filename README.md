@@ -57,13 +57,13 @@ The round power button beside the clock is part of the launcher, not of the
 configuration: press Up from the tile row to select it (Down goes back to the tiles) and
 Enter, or click it, to open the power menu with Desktop Mode, Restart and Shutdown. Esc
 leaves the menu. Restart and Shutdown ask for confirmation first, with Cancel selected,
-so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in the configuration ask the
-same way.
+so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in a
+submenu of the configuration ask the same way.
 
 **Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
-vexos-nix HTPC module sent them). A configuration that still sends them keeps working, but
-they are then shown twice, as tiles and in the power menu. Remove them from the
-configuration to avoid that.
+vexos-nix HTPC module sent them). The button replaces them, so the launcher leaves out of
+the main row any tile with a `desktop-mode`, `shutdown` or `restart` builtin, and any tile
+opening a submenu of only those. Such tiles in a submenu mixed with other tiles stay.
 
 All top-level keys are optional. `title` is shown under the greeting, `homeKey` names
 the key that closes the open app in the key hints, and without `background` the
