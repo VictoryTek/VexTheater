@@ -128,6 +128,37 @@ fn start_with(action: &Action, env: &Env) -> anyhow::Result<Running> {
     }
 }
 
+/// Whether the app behind `action` is installed, as far as the launcher can tell. Only a
+/// `desktop` or a `flatpak` action can be found not to be; anything else, a `command`
+/// included, is taken as runnable.
+pub fn is_installed(action: &Action) -> bool {
+    match action {
+        Action::Desktop(id) => gio::DesktopAppInfo::new(id).is_some(),
+        Action::Flatpak(id) => flatpak_installed(id, &flatpak_app_dirs()),
+        _ => true,
+    }
+}
+
+/// Where Flatpak keeps an installed app: one directory per application id.
+fn flatpak_app_dirs() -> [PathBuf; 2] {
+    [
+        PathBuf::from("/var/lib/flatpak/app"),
+        glib::user_data_dir().join("flatpak/app"),
+    ]
+}
+
+/// A Flatpak is installed if its exported desktop file is in the data directories, or
+/// it has a directory in one of `app_dirs`. The second covers a service whose
+/// `XDG_DATA_DIRS` lacks Flatpak's export directories, which would otherwise mark an
+/// installed app missing.
+fn flatpak_installed(id: &str, app_dirs: &[PathBuf]) -> bool {
+    if id.is_empty() || id.contains('/') {
+        return false;
+    }
+    gio::DesktopAppInfo::new(&format!("{id}.desktop")).is_some()
+        || app_dirs.iter().any(|dir| dir.join(id).is_dir())
+}
+
 fn next_id() -> String {
     let n = NEXT_LAUNCH.with(|next| next.replace(next.get() + 1));
     format!("vextheater-app-{}-{n}", std::process::id())
@@ -1042,6 +1073,28 @@ mod tests {
             ]
         );
         assert!(exec_argv("   ").is_err());
+    }
+
+    #[test]
+    fn a_flatpak_with_an_installation_directory_is_installed() {
+        let dir = std::env::temp_dir().join(format!("vextheater-apps-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("org.example.Here")).unwrap();
+        let dirs = [dir.clone()];
+        assert!(flatpak_installed("org.example.Here", &dirs));
+        assert!(!flatpak_installed("org.example.NotHere", &dirs));
+        assert!(!flatpak_installed("../vextheater-apps-x", &dirs));
+        assert!(!flatpak_installed("", &dirs));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_desktop_and_flatpak_actions_can_be_missing() {
+        assert!(is_installed(&Action::Command("no-such-program".into())));
+        assert!(is_installed(&Action::Submenu("Games".into())));
+        assert!(!is_installed(&Action::Desktop(
+            "no.such.App.desktop".into()
+        )));
+        assert!(!is_installed(&Action::Flatpak("no.such.App".into())));
     }
 
     #[test]

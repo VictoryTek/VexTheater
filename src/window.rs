@@ -9,7 +9,7 @@ use crate::sound::Sounds;
 use crate::{gnome, launch, order};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -295,6 +295,10 @@ struct Ui {
     own_pages: Vec<OwnPage>,
     /// First tile of each page, focused when the page opens.
     first_tiles: RefCell<HashMap<String, gtk::Button>>,
+    /// The name and description labels under each page's row.
+    labels: RefCell<HashMap<String, (gtk::Label, gtk::Label)>>,
+    /// Tiles (page and configured index) whose app was not installed when last checked.
+    missing: RefCell<HashSet<(String, usize)>>,
     /// The row of tiles on each page, resized to the window by `fit_tiles`.
     rows: RefCell<Vec<gtk::Box>>,
     /// Pages left by opening a submenu, with the tile that opened each.
@@ -412,6 +416,8 @@ impl Ui {
             stack,
             own_pages: own_pages(),
             first_tiles: RefCell::default(),
+            labels: RefCell::default(),
+            missing: RefCell::default(),
             rows: RefCell::default(),
             history: RefCell::default(),
             pointer_visible: Cell::new(false),
@@ -561,6 +567,7 @@ impl Ui {
     fn show(&self) {
         mode::save(Mode::Theater);
         gnome::theater_mode();
+        self.refresh_installed();
         self.window.fullscreen();
         self.window.present();
     }
@@ -659,6 +666,9 @@ impl Ui {
                 Config::default_path().display()
             ));
         }
+        self.labels
+            .borrow_mut()
+            .insert(page.to_owned(), (name.clone(), description.clone()));
         column.append(&name);
         column.append(&description);
         column.append(&self.hints(submenu.is_some(), !tiles.is_empty()));
@@ -673,19 +683,19 @@ impl Ui {
         for (position, index) in positions.into_iter().enumerate() {
             let tile = &tiles[index];
             let button = tile_button(tile);
+            self.check_installed(page, index, &button);
             if position == 0 {
                 self.first_tiles
                     .borrow_mut()
                     .insert(page.to_owned(), button.clone());
-                show_selected(&name, &description, tile);
+                self.show_tile(page, index);
             }
 
             let focus = gtk::EventControllerFocus::new();
             focus.connect_enter({
-                let (name, description) = (name.clone(), description.clone());
                 let (ui, page, index) = (self.clone(), page.to_owned(), index);
                 move |_| {
-                    show_selected(&name, &description, ui.tile(&page, index));
+                    ui.show_tile(&page, index);
                     if ui.navigating.get() {
                         ui.sounds.moved();
                     }
@@ -1087,6 +1097,48 @@ impl Ui {
         hints
     }
 
+    /// Marks the tile `button` (tile `index` of `page`) as missing, dimmed, if its app is
+    /// not installed, and as present otherwise.
+    fn check_installed(&self, page: &str, index: usize, button: &gtk::Button) {
+        let key = (page.to_owned(), index);
+        if launch::is_installed(&self.tile(page, index).action) {
+            self.missing.borrow_mut().remove(&key);
+            button.remove_css_class("unavailable");
+        } else {
+            self.missing.borrow_mut().insert(key);
+            button.add_css_class("unavailable");
+        }
+    }
+
+    /// Checks every configured tile again, for an app installed or removed since, and
+    /// brings the description of the selected tile up to date.
+    fn refresh_installed(&self) {
+        for (page, tiles) in self.arrangeable.borrow().iter() {
+            for (index, button) in tiles.buttons.iter().enumerate() {
+                self.check_installed(page, index, button);
+                if button.is_focus() {
+                    self.show_tile(page, index);
+                }
+            }
+        }
+    }
+
+    /// Shows the name and description of a tile under its page's row. A tile whose app
+    /// is not installed says so instead of its description.
+    fn show_tile(&self, page: &str, index: usize) {
+        let labels = self.labels.borrow();
+        let Some((name, description)) = labels.get(page) else {
+            return;
+        };
+        let tile = self.tile(page, index);
+        if self.missing.borrow().contains(&(page.to_owned(), index)) {
+            name.set_label(&tile.name);
+            description.set_label("Not installed");
+        } else {
+            show_selected(name, description, tile);
+        }
+    }
+
     fn tile(&self, page: &str, index: usize) -> &Tile {
         let tiles = match page.strip_prefix("submenu:") {
             Some(name) => &self.config.submenus[name],
@@ -1129,6 +1181,13 @@ impl Ui {
             }
             Action::Builtin(Builtin::Cancel) => {
                 self.back();
+                Ok(())
+            }
+            // Checked again here, not read from `missing`: the app may have been installed
+            // since. Nothing is closed for an app that cannot start.
+            action if !launch::is_installed(action) => {
+                self.toasts
+                    .add_toast(adw::Toast::new(&format!("{} isn't installed", tile.name)));
                 Ok(())
             }
             action => {

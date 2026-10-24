@@ -119,7 +119,7 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: `cargo test` (the `skip_deserializing` tests at `config.rs:214-228` become type-level guarantees, so remove or rewrite them); an `order.json` saved before the change still loads.
 
 ### Batch 3.8: Mark tiles whose app is not installed (Tier 2, M) (downgraded from high)
-- [ ] **FEAT-04**: when building the pages and on `show()`, check `desktop` tiles with `DesktopAppInfo::new(id)` and `flatpak` tiles with `"<id>.desktop"`. A tile that fails gets the `.unavailable` CSS class and the description "Not installed", and choosing it shows a toast without calling `close_then`. `command` tiles are not checked.
+- [x] **FEAT-04**: when building the pages and on `show()`, check `desktop` tiles with `DesktopAppInfo::new(id)` and `flatpak` tiles with `"<id>.desktop"`. A tile that fails gets the `.unavailable` CSS class and the description "Not installed", and choosing it shows a toast without calling `close_then`. `command` tiles are not checked.
   → verify: configure a desktop tile that does not exist and take screenshots; `cargo test`.
 
 ### Batch 3.9: Turn off the Super-key overview in theater mode (Tier 2, M)

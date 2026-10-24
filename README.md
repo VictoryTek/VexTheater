@@ -63,6 +63,13 @@ runs while building (see `--check-config` below), would otherwise reject it.
 
 A configuration with no tiles shows "No tiles configured" and the power button.
 
+A `desktop` tile whose desktop file is not installed, and a `flatpak` tile whose app is
+not (its exported desktop file is not found, and it has no installation directory in
+`/var/lib/flatpak/app` or `~/.local/share/flatpak/app`), is dimmed and says "Not
+installed"; choosing it only shows a message, and the open app is left running. This is
+checked when the launcher is built and each time it is shown again. `command` tiles are
+not checked.
+
 Tiles shrink from 200 px to fit the row on a narrow screen. A long row then closes up
 the gaps between tiles before shrinking the tiles below 100 px (past about 15 tiles on a
 1920 px screen), so a row of any length stays on screen.

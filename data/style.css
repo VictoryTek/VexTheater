@@ -92,6 +92,11 @@ button.tile:focus:active {
   transform: translateY(-12px) scale(1.06);
 }
 
+/* A tile whose app is not installed: dimmed, and choosing it only says so. */
+button.tile.unavailable {
+  opacity: 0.4;
+}
+
 /* A tile picked up for moving: lifted higher than a selected one, with a solid ring. */
 button.tile.picked:focus {
   background-color: var(--accent-bg-color);
