@@ -4,6 +4,7 @@ mod clock;
 mod config;
 mod files;
 mod gnome;
+mod keybinding;
 mod launch;
 mod mode;
 mod order;

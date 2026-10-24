@@ -19,6 +19,7 @@ imports = [ inputs.vextheater.nixosModules.default ];
 programs.vextheater = {
   enable = true;
   autostart = true;
+  homeKey = "F10";               # optional: the home key, see "The home key" below
   settings = { /* see below */ };
 };
 ```
@@ -145,8 +146,8 @@ launcher uses a plain dark gradient.
   shutting down. Only one close runs at a time: tiles chosen (or home pressed) during
   a close replace each other, and only the last one is acted on when it finishes.
   Choosing Desktop Mode cancels a pending tile.
-  `vextheater --home` closes the app and shows the launcher again (bind it to a key in
-  GNOME's keyboard shortcuts, or to a remote's Home button). Both close every
+  `vextheater --home` closes the app and shows the launcher again (see "The home key"
+  below for the shortcut). Both close every
   `vextheater-app-*` scope and recorded Flatpak instance, including apps left running
   by a launcher that crashed. When the launcher comes back, whether by home or because
   the app exited, it selects the tile that opened that app (for a tile in a submenu, the
@@ -234,6 +235,47 @@ launcher uses a plain dark gradient.
   the launcher's control: home cannot close it, and the launcher comes back in front
   of it.
 
+### The home key
+
+`programs.vextheater.homeKey = "F10";` (a GNOME accelerator name such as `F10` or
+`<Super>h`) is the one place the home key is set. It sets `settings.homeKey`, which the
+key hints show, and the launcher makes sure GNOME has a custom shortcut for it, named
+"VexTheater home", that runs `vextheater --home`, so the key closes the open app and
+brings the launcher back from any app and from desktop mode. The command is
+`/run/current-system/sw/bin/vextheater --home` where that exists, else `vextheater --home`;
+never a store path, which changes with every rebuild and goes away with a garbage
+collection.
+
+The launcher does this itself, when it starts and when `--reload` changes `homeKey`,
+because a NixOS dconf database cannot: dconf does not merge lists, so a list of custom
+shortcuts declared there is hidden by the user's own, if they have one. Instead the
+launcher adds its shortcut to the list the user sees and leaves every other shortcut
+alone. A shortcut that is already right is not written again. **If you edit this one
+shortcut by hand in GNOME Settings, the launcher puts it back at its next start**; to
+change the key, change `homeKey`. Without `homeKey` the launcher removes its shortcut.
+Setting `settings.homeKey` to a different value as well is a conflict the module reports.
+
+The launcher owns the shortcut whenever it loads a configuration, whichever file that is.
+A development run with `VEXTHEATER_CONFIG=<file.json>` on a machine that has the module
+therefore rewrites the real shortcut to that file's `homeKey`, or removes it if the file
+has none, and it stays so until the real launcher next starts or reloads.
+
+If the shortcut never appears, the launcher may not see GNOME's schemas (the same
+`XDG_DATA_DIRS` issue as under Troubleshooting); start it with `RUST_LOG=info` to see
+what it did or why it did nothing.
+
+Uninstalling VexTheater leaves the shortcut behind, pointing at a program that is gone.
+Remove it by hand:
+
+```sh
+gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings
+# set that list again without the .../custom-keybindings/vextheater-home/ entry, e.g.
+gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "[]"
+```
+
+(The last command empties the whole list; put back any shortcuts of your own that the
+first command showed.)
+
 ### Restoring GNOME settings by hand
 
 Uninstalling VexTheater, or removing its NixOS module, while the launcher is running
@@ -261,9 +303,12 @@ and `gsettings reset` puts the Super key back to GNOME's default.)
 
 These depend on the real desktop, so they can only be checked on the machine:
 
-- **Home from desktop mode.** In desktop mode, run `vextheater --home` from a GNOME
-  keyboard shortcut. GNOME 50 must bring the launcher to the front; if it only shows
-  a "VexTheater is ready" notification, the launcher cannot raise itself from there.
+- **Home from desktop mode.** In desktop mode, press the home key (the shortcut the
+  launcher registers for `homeKey`; see "The home key"), also over a running app. GNOME
+  50 must bring the launcher to the front; if it only shows a "VexTheater is ready"
+  notification, the launcher cannot raise itself from there. Check that GNOME runs the
+  shortcut at all: `gsettings get org.gnome.settings-daemon.plugins.media-keys
+  custom-keybindings` lists it after the launcher has started.
 - **What the remote sends.** Run `wev` and press the remote's Back, Select (OK) and
   Home buttons. The launcher takes `XF86Back` as Esc, `XF86Select`, `XF86OK` and the
   old `Select` as Enter, and `XF86HomePage` as "back to the tile row", on top of the

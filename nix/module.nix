@@ -40,6 +40,23 @@ in
       starting VexTheater with every graphical session, as a systemd user service
       that is restarted if it crashes'';
 
+    homeKey = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "F10";
+      description = ''
+        The key that closes the open app and brings the launcher back, from any app and
+        from desktop mode, as a GNOME accelerator name such as `F10` or `<Super>h`. It
+        sets `settings.homeKey`, which the key hints show, and the launcher itself makes
+        sure GNOME has a custom shortcut for it that runs `vextheater --home`: it adds
+        the shortcut to the user's own list of custom shortcuts, so shortcuts they have
+        are kept, and puts the shortcut back at the next start if it was changed by
+        hand. A NixOS dconf database could not do this, because dconf does not merge
+        lists. With it unset, the launcher removes its own shortcut. Setting
+        `settings.homeKey` to a different value as well is a conflict.
+      '';
+    };
+
     settings = lib.mkOption {
       type = json.type;
       default = { };
@@ -61,6 +78,8 @@ in
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
+
+    programs.vextheater.settings = lib.mkIf (cfg.homeKey != null) { homeKey = cfg.homeKey; };
 
     environment.etc."vextheater/config.json".source = checkedSettings;
 

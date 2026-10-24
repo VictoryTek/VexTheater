@@ -131,7 +131,7 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: edit the file while the launcher runs, then run `--reload`; an app that is running stays tracked (home still closes it).
 
 ### Batch 3.11: Home key from one module option (Tier 3, M)
-- [ ] **FEAT-12**: add a `programs.vextheater.homeKey` option that sets `settings.homeKey` and a GNOME custom keybinding (through `programs.dconf.profiles.user.databases`) running `vextheater --home`. The new binding must be merged with the user's existing custom keybindings, not replace them. Coordinate with vexos-nix, which can then drop its own binding.
+- [x] **FEAT-12**: add a `programs.vextheater.homeKey` option that sets `settings.homeKey`; the launcher registers the GNOME custom shortcut running `vextheater --home` itself, at start and on `--reload`, merging it into the user's own list (a NixOS dconf database cannot: dconf does not merge lists, and a user's list hides a system one). Done as approved; the command is `/run/current-system/sw/bin/vextheater --home` when that exists. vexos-nix can then drop its own binding.
   → verify: a NixOS VM test or a check of the generated dconf database; `nix build path:.`.
 
 ### Batch 3.12: Upgrade the gtk-rs stack (Tier 3, M)

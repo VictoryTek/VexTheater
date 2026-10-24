@@ -4,6 +4,7 @@
 
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
+use crate::keybinding;
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
 use crate::widgets::{hint, label};
@@ -712,6 +713,7 @@ impl Ui {
             move |visible| ui.pointer_visible.set(visible)
         });
         window.set_content(Some(&ui.toasts));
+        keybinding::sync(ui.config.borrow().home_key.as_deref());
         let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
         GtkWindowExt::set_focus(window, first.as_ref().or(Some(&ui.power_button)));
         ui
@@ -797,6 +799,7 @@ impl Ui {
             .retain(|page, _| !from_config(page));
         self.rows.borrow_mut().retain(|row| row.root().is_some());
 
+        let home_key_changed = config.home_key != self.config.borrow().home_key;
         if config.background != self.config.borrow().background {
             let background = background_widget(config.background.as_deref());
             self.overlay.set_child(Some(&background));
@@ -808,6 +811,9 @@ impl Ui {
             .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
             .collect();
         *self.config.borrow_mut() = config;
+        if home_key_changed {
+            keybinding::sync(self.config.borrow().home_key.as_deref());
+        }
 
         self.add_config_pages();
         if self.width.get() > 0 {
