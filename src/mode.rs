@@ -2,6 +2,7 @@
 //! after a crash can go back to it. The runtime directory is cleared when the session
 //! ends, and the file is removed on a clean exit, so only a crash leaves it behind.
 
+use crate::gnome;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -16,7 +17,26 @@ fn file() -> PathBuf {
     glib::user_runtime_dir().join("vextheater").join("mode")
 }
 
-pub fn save(mode: Mode) {
+/// Theater mode: the launcher is shown, and GNOME's hot corner, Super key and banners
+/// are turned off until it leaves.
+pub fn enter_theater() {
+    save(Mode::Theater);
+    gnome::theater_mode();
+}
+
+/// Desktop mode: GNOME's settings are put back.
+pub fn enter_desktop() {
+    save(Mode::Desktop);
+    gnome::restore();
+}
+
+/// The launcher is quitting: GNOME's settings are put back and the mode forgotten.
+pub fn exit() {
+    gnome::restore();
+    clear();
+}
+
+fn save(mode: Mode) {
     let name = match mode {
         Mode::Theater => "theater",
         Mode::Desktop => "desktop",

@@ -135,16 +135,6 @@ pub enum Builtin {
     DesktopMode,
     Shutdown,
     Restart,
-    /// Leaves a confirmation page. Only the launcher's own pages use it: a
-    /// configuration cannot ask for it.
-    #[serde(skip_deserializing)]
-    Cancel,
-    /// Lets the user pick tiles up and move them. Only the power menu uses it.
-    #[serde(skip_deserializing)]
-    Arrange,
-    /// Puts the tiles back in the configured order. Only the power menu uses it.
-    #[serde(skip_deserializing)]
-    ResetOrder,
 }
 
 impl Config {
@@ -403,6 +393,8 @@ mod tests {
         assert!(Config::parse(text).is_err());
     }
 
+    // The launcher's own commands are not builtins: the type has no such values, so a
+    // configuration cannot name them, and the JSON for them is refused.
     #[test]
     fn a_configuration_cannot_use_the_launchers_own_cancel() {
         let text = r#"{ "tiles": [ { "name": "A", "icon": "a", "builtin": "cancel" } ] }"#;

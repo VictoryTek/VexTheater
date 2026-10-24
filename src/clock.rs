@@ -1,13 +1,16 @@
 //! The time and date for the top-right corner, and the greeting on the main row.
 
-use crate::window::label;
+use crate::widgets::label;
 use gtk::prelude::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub struct Clock {
     pub widget: gtk::Box,
     time: gtk::Label,
     date: gtk::Label,
-    greetings: std::cell::RefCell<Vec<gtk::Label>>,
+    /// Weak, so the greeting of a page that was replaced is not kept alive.
+    greetings: Rc<RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
     time_format: &'static str,
 }
 
@@ -43,7 +46,10 @@ impl Clock {
     pub fn greeting(&self) -> gtk::Label {
         let greeting = label("greeting");
         greeting.set_halign(gtk::Align::Start);
-        self.greetings.borrow_mut().push(greeting.clone());
+        if let Ok(now) = glib::DateTime::now_local() {
+            greeting.set_label(greeting_for(&now));
+        }
+        self.greetings.borrow_mut().push(greeting.downgrade());
         greeting
     }
 
@@ -53,7 +59,7 @@ impl Clock {
         let (time, date, greetings, format) = (
             self.time.clone(),
             self.date.clone(),
-            self.greetings.borrow().clone(),
+            self.greetings.clone(),
             self.time_format,
         );
         update(&time, &date, &greetings, format);
@@ -64,7 +70,12 @@ impl Clock {
     }
 }
 
-fn update(time: &gtk::Label, date: &gtk::Label, greetings: &[gtk::Label], format: &str) {
+fn update(
+    time: &gtk::Label,
+    date: &gtk::Label,
+    greetings: &RefCell<Vec<glib::WeakRef<gtk::Label>>>,
+    format: &str,
+) {
     let Ok(now) = glib::DateTime::now_local() else {
         return;
     };
@@ -74,13 +85,21 @@ fn update(time: &gtk::Label, date: &gtk::Label, greetings: &[gtk::Label], format
     if let Ok(text) = now.format("%A, %B %-d") {
         date.set_label(&text);
     }
-    let greeting = match now.hour() {
+    let greeting = greeting_for(&now);
+    greetings.borrow_mut().retain(|label| {
+        let Some(label) = label.upgrade() else {
+            return false;
+        };
+        label.set_label(greeting);
+        true
+    });
+}
+
+fn greeting_for(now: &glib::DateTime) -> &'static str {
+    match now.hour() {
         0..=11 => "Good morning",
         12..=17 => "Good afternoon",
         _ => "Good evening",
-    };
-    for label in greetings {
-        label.set_label(greeting);
     }
 }
 

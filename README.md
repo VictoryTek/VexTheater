@@ -154,6 +154,12 @@ launcher uses a plain dark gradient.
   - `vextheater --desktop` hides the launcher like Desktop Mode, and `vextheater
     --toggle` shows it when it is hidden and hides it when it is shown, so one key can
     switch between theater and desktop mode.
+  - `vextheater --reload` reads the configuration again and rebuilds the tiles, titles
+    and background in the running launcher, which is also done whenever the launcher
+    is shown again and the file has changed. The open app, a close in progress and the
+    saved tile order are not touched. A configuration that cannot be read leaves the
+    tiles as they were and says why; nothing is rebuilt while an app is closing or a
+    tile is picked up (a reload asked for says so).
   - No process gets two SIGTERMs: Chromium-based apps like Brave start a clean
     shutdown on the first and die on a second. An ordinary app is stopped through its
     scope; the app started last is signalled directly only if its scope has not
@@ -209,7 +215,9 @@ launcher uses a plain dark gradient.
   in desktop mode stays in desktop mode, and one that crashed in theater mode comes
   back full screen. A clean exit removes the file, and a new login starts in theater
   mode.
-- While the launcher is showing, GNOME's hot corner and notification banners are off.
+- While the launcher is showing, GNOME's hot corner, the Super key's overview and
+  notification banners are off (the Super key by clearing `org.gnome.mutter overlay-key`,
+  so it does nothing in theater mode; Super+key shortcuts are not touched).
   The values they had before are saved to `~/.local/state/vextheater/gnome-settings.json`
   and put back on desktop mode, quitting, closing the window (Alt+F4), SIGTERM and
   SIGINT. A launcher restarted after a crash keeps the saved file, so the original
@@ -229,21 +237,23 @@ launcher uses a plain dark gradient.
 ### Restoring GNOME settings by hand
 
 Uninstalling VexTheater, or removing its NixOS module, while the launcher is running
-cannot put the hot corner and banners back: the program that would do it is gone.
-Restore them yourself:
+cannot put the hot corner, the Super key and banners back: the program that would do it
+is gone. Restore them yourself:
 
 ```sh
 cat ~/.local/state/vextheater/gnome-settings.json   # the saved values, if any
 gsettings set org.gnome.desktop.interface enable-hot-corners true
 gsettings set org.gnome.desktop.notifications show-banners true
+gsettings reset org.gnome.mutter overlay-key       # or set the value from the file
 rm -f ~/.local/state/vextheater/gnome-settings.json
 ```
 
-(Use the values from the file if it exists; `true` is GNOME's default for both.)
+(Use the values from the file if it exists; `true` is GNOME's default for the first two,
+and `gsettings reset` puts the Super key back to GNOME's default.)
 
 ### Troubleshooting
 
-- The hot corner or banners never turn off: the launcher finds GNOME's settings
+- The hot corner, Super key or banners never turn off: the launcher finds GNOME's settings
   schemas through `XDG_DATA_DIRS`, and if `systemctl --user show-environment` shows it
   empty, the launcher quietly can't change GNOME settings.
 
@@ -263,6 +273,11 @@ These depend on the real desktop, so they can only be checked on the machine:
   the binding with
   `gsettings list-recursively org.gnome.settings-daemon.plugins.media-keys | grep -i homepage`
   (no output on the development machine, where Home was not grabbed).
+- **The Super key.** In theater mode, pressing Super must do nothing (no overview over a
+  film). After Desktop Mode, a clean exit, or a crash followed by `--resume`, it must
+  open the overview again. The values are checked off the device (the state file, and
+  `gsettings get org.gnome.mutter overlay-key`); only GNOME itself shows that the key
+  really stops reacting.
 - **GNOME settings reachable.** `systemctl --user show-environment | grep XDG_DATA_DIRS`
   must not be empty (see Troubleshooting above).
 - **Flatpak keeps one process id.** The launcher closes a Flatpak app through the

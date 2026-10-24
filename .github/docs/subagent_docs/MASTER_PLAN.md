@@ -114,8 +114,8 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: config tests for two actions, a misspelled key, a missing icon on each action kind, and the README example; update README and the module docs. Needs Batches 2.1 and 2.3 first.
 
 ### Batch 3.7: Page and command types (Tier 3 because it touches `config.rs`, M)
-- [ ] **A2**: add `enum Page { Main, Submenu(String), Power, Confirm(Builtin) }` with one `key()`/`from_key()` pair, use an exhaustive confirm mapping with no `_` arm, and have `tile()` match on `Page`. Keep the key strings byte-for-byte the same so existing `order.json` files still load.
-- [ ] **A3**: reduce `config::Builtin` to the three schema values, and add a UI-side `enum Command { Config(Action), Cancel, Arrange, ResetOrder }` in `window.rs`. The JSON contract does not change.
+- [x] **A2**: add `enum Page { Main, Submenu(String), Power, Confirm(Confirmable) }` (with `Confirmable { Shutdown, Restart, ResetOrder }`, since `Builtin` cannot name the reset confirmation) with one `key()`/`from_key()` pair, use an exhaustive confirm mapping with no `_` arm, and have `tile()` match on `Page`. Keep the key strings byte-for-byte the same so existing `order.json` files still load.
+- [x] **A3**: reduce `config::Builtin` to the three schema values, and add a UI-side `enum Command { Config(Action), Cancel, Arrange, ResetOrder }` and a UI-side `Entry { name, icon, description, command }` (what the window code shows, built from a configured `Tile` or directly for its own pages) in `window.rs`. The JSON contract does not change.
   → verify: `cargo test` (the `skip_deserializing` tests at `config.rs:214-228` become type-level guarantees, so remove or rewrite them); an `order.json` saved before the change still loads.
 
 ### Batch 3.8: Mark tiles whose app is not installed (Tier 2, M) (downgraded from high)
@@ -123,11 +123,11 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: configure a desktop tile that does not exist and take screenshots; `cargo test`.
 
 ### Batch 3.9: Turn off the Super-key overview in theater mode (Tier 2, M)
-- [ ] **FEAT-08**: add `org.gnome.mutter overlay-key` to `gnome::KEYS`. `Values` must then hold variant text instead of `bool`, and old files holding `true`/`false` must still load. Update the README's restore-by-hand section.
+- [x] **FEAT-08**: add `org.gnome.mutter overlay-key` to `gnome::KEYS`. `Values` must then hold variant text instead of `bool`, and old files holding `true`/`false` must still load. Update the README's restore-by-hand section.
   → verify: unit tests for reading an old-format file; on the device, Super does nothing in theater mode and works again after desktop mode, a clean exit, or a crash followed by `--resume`.
 
 ### Batch 3.10: Reload the config (Tier 2, M)
-- [ ] **FEAT-10**: `vextheater --reload` rebuilds the pages in the existing window and keeps `running`, the close queue and the toasts. When loading fails, keep the old tiles and show a toast. Also reload on `show()` when the file has changed. Don't rebuild while a close is running or a tile is picked up. This is easier after A1 (Batch 3.13).
+- [x] **FEAT-10**: `vextheater --reload` rebuilds the pages in the existing window and keeps `running`, the close queue and the toasts. When loading fails, keep the old tiles and show a toast. Also reload on `show()` when the file has changed. Don't rebuild while a close is running or a tile is picked up. This is easier after A1 (Batch 3.13).
   → verify: edit the file while the launcher runs, then run `--reload`; an app that is running stays tracked (home still closes it).
 
 ### Batch 3.11: Home key from one module option (Tier 3, M)
@@ -139,8 +139,8 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: build, `cargo test`, clippy, `cargo audit`, `nix build path:.`, and screenshots at both resolutions.
 
 ### Batch 3.13: Split `window.rs` (Tier 2, M–L), do after 3.7
-- [ ] **A10** (low, prerequisite): move `label` and `hint` into a `widgets.rs` to break the `clock` ↔ `window` cycle.
-- [ ] **A9** (low, prerequisite): have `mode.rs` own the transitions (`enter_theater`, `enter_desktop`, `exit`, each also making the `gnome` call), and call them from `window.rs` and `main.rs`.
+- [x] **A10** (low, prerequisite): move `label` and `hint` into a `widgets.rs` to break the `clock` ↔ `window` cycle.
+- [x] **A9** (low, prerequisite): have `mode.rs` own the transitions (`enter_theater`, `enter_desktop`, `exit`, each also making the `gnome` call), and call them from `window.rs` and `main.rs`.
 - [ ] **A1**: move arranging into `arrange.rs` and the app lifecycle (`CloseQueue`, `running`, `close_then`, `start`, `app_exited`) into its own controller that reports through a callback. `Ui` stays the composer.
   → verify: `cargo test` passes before and after each step; clippy pedantic no longer flags `too_many_lines` on `Ui::build`; screenshots show no change.
 

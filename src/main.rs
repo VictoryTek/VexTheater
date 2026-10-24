@@ -8,6 +8,7 @@ mod launch;
 mod mode;
 mod order;
 mod sound;
+mod widgets;
 mod window;
 
 use adw::prelude::*;
@@ -50,8 +51,7 @@ fn main() -> glib::ExitCode {
     // Every way out ends here: quitting, closing the last window (Alt+F4), and the
     // signals below, which systemd sends when the session ends.
     application.connect_shutdown(|_| {
-        gnome::restore();
-        mode::clear();
+        mode::exit();
     });
     for signal in [libc::SIGINT, libc::SIGTERM] {
         let application = application.clone();

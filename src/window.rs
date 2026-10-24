@@ -6,16 +6,14 @@ use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
-use crate::{gnome, launch, order};
+use crate::widgets::{hint, label};
+use crate::{launch, order};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-const MAIN_PAGE: &str = "main";
-const POWER_PAGE: &str = "power";
-const CONFIRM_PREFIX: &str = "confirm:";
 const PAGE_MARGIN: i32 = 96;
 const TILE_SPACING: i32 = 40;
 /// Tiles are this big when the screen has room, and shrink to fit the row on it.
@@ -34,6 +32,138 @@ const LONG_PRESS: Duration = Duration::from_millis(600);
 const NOT_CLOSED: &str = "Couldn't close the previous app";
 const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
 const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  Back  done";
+
+/// What choosing a tile does. A configured tile does what its action says; the rest are
+/// the launcher's own, which a configuration cannot ask for.
+#[derive(Clone, Debug, PartialEq)]
+enum Command {
+    Config(Action),
+    /// Leaves a confirmation page.
+    Cancel,
+    /// Lets tiles be picked up and moved. Only the power menu has it.
+    Arrange,
+    /// Puts the tiles back in the configured order. The power menu and its confirmation
+    /// have it.
+    ResetOrder,
+}
+
+impl Command {
+    /// Whether the app behind it is installed; only a configured app can be missing.
+    fn is_installed(&self) -> bool {
+        match self {
+            Command::Config(action) => launch::is_installed(action),
+            Command::Cancel | Command::Arrange | Command::ResetOrder => true,
+        }
+    }
+}
+
+/// A tile as the launcher shows it: one from the configuration, or one of its own pages.
+#[derive(Clone, Debug, PartialEq)]
+struct Entry {
+    name: String,
+    /// An icon-theme name or an image file; see `config::Tile::icon`.
+    icon: Option<String>,
+    description: Option<String>,
+    command: Command,
+}
+
+impl From<&Tile> for Entry {
+    fn from(tile: &Tile) -> Entry {
+        Entry {
+            name: tile.name.clone(),
+            icon: tile.icon.clone(),
+            description: tile.description.clone(),
+            command: Command::Config(tile.action.clone()),
+        }
+    }
+}
+
+/// A page of the launcher. Each has one name, [`Page::key`], which is its child name in
+/// the stack and, for the pages whose tiles can be arranged, its key in `order.json`.
+/// Existing files hold those strings, so they must not change.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Page {
+    Main,
+    /// The tiles a `submenu` tile opens, by the submenu's name.
+    Submenu(String),
+    Power,
+    Confirm(Confirmable),
+}
+
+/// What a confirmation page asks about: the actions that power the machine off or
+/// discard something, which are never taken on a single key press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Confirmable {
+    Shutdown,
+    Restart,
+    ResetOrder,
+}
+
+impl Confirmable {
+    /// The action `command` asks to confirm, if it is one that needs it.
+    fn of(command: &Command) -> Option<Confirmable> {
+        match command {
+            Command::Config(Action::Builtin(Builtin::Shutdown)) => Some(Confirmable::Shutdown),
+            Command::Config(Action::Builtin(Builtin::Restart)) => Some(Confirmable::Restart),
+            Command::ResetOrder => Some(Confirmable::ResetOrder),
+            Command::Config(
+                Action::Builtin(Builtin::DesktopMode)
+                | Action::Command(_)
+                | Action::Desktop(_)
+                | Action::Flatpak(_)
+                | Action::Submenu(_),
+            )
+            | Command::Cancel
+            | Command::Arrange => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Confirmable::Shutdown => "shutdown",
+            Confirmable::Restart => "restart",
+            Confirmable::ResetOrder => "reset",
+        }
+    }
+}
+
+impl Page {
+    const MAIN: &'static str = "main";
+    const POWER: &'static str = "power";
+    const SUBMENU_PREFIX: &'static str = "submenu:";
+    const CONFIRM_PREFIX: &'static str = "confirm:";
+
+    fn key(&self) -> String {
+        match self {
+            Page::Main => Self::MAIN.to_owned(),
+            Page::Submenu(name) => format!("{}{name}", Self::SUBMENU_PREFIX),
+            Page::Power => Self::POWER.to_owned(),
+            Page::Confirm(confirm) => format!("{}{}", Self::CONFIRM_PREFIX, confirm.key()),
+        }
+    }
+
+    /// The page named `key`, if there is one.
+    fn from_key(key: &str) -> Option<Page> {
+        if let Some(name) = key.strip_prefix(Self::SUBMENU_PREFIX) {
+            return Some(Page::Submenu(name.to_owned()));
+        }
+        if let Some(action) = key.strip_prefix(Self::CONFIRM_PREFIX) {
+            return [
+                Confirmable::Shutdown,
+                Confirmable::Restart,
+                Confirmable::ResetOrder,
+            ]
+            .into_iter()
+            .find(|confirm| confirm.key() == action)
+            .map(Page::Confirm);
+        }
+        match key {
+            Self::MAIN => Some(Page::Main),
+            Self::POWER => Some(Page::Power),
+            _ => None,
+        }
+    }
+}
 
 thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
@@ -78,6 +208,12 @@ pub fn command_line(
             }
             0
         }
+        [flag] if flag == "--reload" => {
+            if let Some(ui) = ui(application) {
+                ui.reload(true);
+            }
+            0
+        }
         // Theater mode if the launcher is hidden, desktop mode if it is shown, so one
         // key can switch between them.
         [flag] if flag == "--toggle" => {
@@ -92,10 +228,11 @@ pub fn command_line(
         }
         _ => {
             command_line.printerr_literal(
-                "usage: vextheater [--home | --desktop | --toggle | --resume | --check-config [FILE]]\n  \
+                "usage: vextheater [--home | --desktop | --toggle | --reload | --resume | --check-config [FILE]]\n  \
                  --home    close the open app and show the launcher\n  \
                  --desktop hide the launcher and show the GNOME desktop\n  \
                  --toggle  show the launcher if it is hidden, else hide it\n  \
+                 --reload  read the configuration again and rebuild the tiles\n  \
                  --resume  show the launcher, unless it crashed in desktop mode\n  \
                  --check-config [FILE]  check a configuration file and exit (first argument)\n",
             );
@@ -170,7 +307,7 @@ fn show_error(
     desktop.connect_clicked({
         let window = window.clone();
         move |_| {
-            mode::save(Mode::Desktop);
+            mode::enter_desktop();
             window.set_visible(false);
         }
     });
@@ -256,6 +393,11 @@ impl<T> CloseQueue<T> {
         self.pending.take()
     }
 
+    /// Whether a close is running.
+    fn is_busy(&self) -> bool {
+        self.closing.get()
+    }
+
     /// Drops the pending request, e.g. when the launcher hides for desktop mode.
     fn cancel(&self) {
         self.pending.replace(None);
@@ -271,14 +413,25 @@ struct Arrangeable {
 
 /// The tile picked up for moving.
 struct Picked {
-    page: String,
+    page: Page,
     button: gtk::Button,
     /// Its place in the row when picked up, to put it back on cancel.
     from: usize,
 }
 
 struct Ui {
-    config: Config,
+    /// Replaced when the configuration is reloaded, as are the tiles made from it.
+    config: RefCell<Config>,
+    /// The tiles of the main row and of each configured submenu.
+    main: RefCell<Vec<Entry>>,
+    submenus: RefCell<BTreeMap<String, Vec<Entry>>>,
+    /// Holds the background, which a reload may change.
+    overlay: gtk::Overlay,
+    /// The width the rows were last fitted to, for the rows of a reload.
+    width: Cell<i32>,
+    /// What a reload on showing the launcher last complained about, so a file that
+    /// stays broken is reported once.
+    reload_error: RefCell<Option<String>>,
     window: adw::ApplicationWindow,
     toasts: adw::ToastOverlay,
     /// The app started from a tile, if it is still running.
@@ -294,15 +447,15 @@ struct Ui {
     /// Pages the launcher adds itself, beside the configured ones.
     own_pages: Vec<OwnPage>,
     /// First tile of each page, focused when the page opens.
-    first_tiles: RefCell<HashMap<String, gtk::Button>>,
+    first_tiles: RefCell<HashMap<Page, gtk::Button>>,
     /// The name and description labels under each page's row.
-    labels: RefCell<HashMap<String, (gtk::Label, gtk::Label)>>,
+    labels: RefCell<HashMap<Page, (gtk::Label, gtk::Label)>>,
     /// Tiles (page and configured index) whose app was not installed when last checked.
-    missing: RefCell<HashSet<(String, usize)>>,
+    missing: RefCell<HashSet<(Page, usize)>>,
     /// The row of tiles on each page, resized to the window by `fit_tiles`.
     rows: RefCell<Vec<gtk::Box>>,
     /// Pages left by opening a submenu, with the tile that opened each.
-    history: RefCell<Vec<(String, gtk::Button)>>,
+    history: RefCell<Vec<(Page, gtk::Button)>>,
     /// Hover selects a tile only while the pointer is shown, so a tile moving under a
     /// hidden pointer cannot steal the keyboard's selection.
     pointer_visible: Cell<bool>,
@@ -311,7 +464,7 @@ struct Ui {
     /// when a page opens or the window is shown again, and those stay silent.
     navigating: Cell<bool>,
     clock: Clock,
-    arrangeable: RefCell<HashMap<String, Arrangeable>>,
+    arrangeable: RefCell<HashMap<Page, Arrangeable>>,
     /// The arranged order, as saved to disk.
     saved_order: RefCell<order::Saved>,
     picked: RefCell<Option<Picked>>,
@@ -332,19 +485,7 @@ impl Ui {
         let overlay = gtk::Overlay::new();
         overlay.add_css_class("theater");
 
-        let background: gtk::Widget = match &config.background {
-            Some(path) => gtk::Picture::builder()
-                .file(&gio::File::for_path(path))
-                .content_fit(gtk::ContentFit::Cover)
-                .can_shrink(true)
-                .build()
-                .upcast(),
-            None => {
-                let plain = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                plain.add_css_class("plain-background");
-                plain.upcast()
-            }
-        };
+        let background = background_widget(config.background.as_deref());
         overlay.set_child(Some(&background));
 
         let scrim = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -405,8 +546,19 @@ impl Ui {
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&overlay));
 
+        let main = config.tiles.iter().map(Entry::from).collect();
+        let submenus = config
+            .submenus
+            .iter()
+            .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
+            .collect();
         let ui = Rc::new(Ui {
-            config,
+            config: RefCell::new(config),
+            main: RefCell::new(main),
+            submenus: RefCell::new(submenus),
+            overlay: overlay.clone(),
+            width: Cell::new(0),
+            reload_error: RefCell::default(),
             window: window.clone(),
             toasts,
             running: RefCell::default(),
@@ -433,12 +585,9 @@ impl Ui {
             arrange_hint,
         });
 
-        ui.add_page(MAIN_PAGE, None, &ui.config.tiles, true);
-        for (name, tiles) in &ui.config.submenus {
-            ui.add_page(&submenu_page(name), Some(name), tiles, true);
-        }
+        ui.add_config_pages();
         for page in &ui.own_pages {
-            ui.add_page(page.key, Some(page.title), &page.tiles, false);
+            ui.add_page(page.page.clone(), Some(page.title), &page.tiles, false);
         }
         ui.clock.start();
 
@@ -446,14 +595,19 @@ impl Ui {
             let ui = ui.clone();
             move |button| {
                 ui.sounds.chosen();
-                ui.open(POWER_PAGE, button);
+                ui.open(Page::Power, button);
             }
         });
         // The power button belongs to the main row only.
         ui.stack.connect_visible_child_name_notify({
             let power_button = power_button.clone();
             move |stack| {
-                power_button.set_visible(stack.visible_child_name().as_deref() == Some(MAIN_PAGE));
+                power_button.set_visible(
+                    stack
+                        .visible_child_name()
+                        .and_then(|name| Page::from_key(&name))
+                        == Some(Page::Main),
+                );
             }
         });
 
@@ -488,7 +642,7 @@ impl Ui {
                     glib::Propagation::Stop
                 }
                 gtk::gdk::Key::Down if power_button.is_focus() => {
-                    let first = ui.first_tiles.borrow().get(MAIN_PAGE).cloned();
+                    let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
                     if let Some(tile) = last_tile.take().or(first.map(Cast::upcast)) {
                         tile.grab_focus();
                     }
@@ -558,15 +712,116 @@ impl Ui {
             move |visible| ui.pointer_visible.set(visible)
         });
         window.set_content(Some(&ui.toasts));
-        let first = ui.first_tiles.borrow().get(MAIN_PAGE).cloned();
+        let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
         GtkWindowExt::set_focus(window, first.as_ref().or(Some(&ui.power_button)));
         ui
     }
 
+    /// Reads the configuration again and, if it changed, rebuilds the pages made from
+    /// it. Nothing else changes: the open app, the close queue and the toasts stay, and
+    /// a configuration that cannot be read leaves the launcher as it is. `announce` is
+    /// for a reload asked for, which says so when there was nothing to do; one on
+    /// showing the launcher says something only when it changed something or found the
+    /// file broken (once, so a file that stays broken is not reported at every show).
+    fn reload(self: &Rc<Self>, announce: bool) {
+        if self.closes.is_busy() || self.picked.borrow().is_some() {
+            if announce {
+                self.notify("Not reloaded now: an app is closing or a tile is picked up");
+            }
+            return;
+        }
+        match Config::load_default() {
+            Ok(config) => {
+                self.reload_error.take();
+                if config == *self.config.borrow() {
+                    if announce {
+                        self.notify("The configuration has not changed");
+                    }
+                    return;
+                }
+                self.rebuild(config);
+                self.notify("Configuration reloaded");
+            }
+            Err(error) => {
+                log::error!("{error:#}");
+                let reason = error.root_cause().to_string();
+                let new = self.reload_error.replace(Some(reason.clone())).as_ref() != Some(&reason);
+                if announce || new {
+                    self.notify(&format!(
+                        "Not reloaded, the configuration is invalid: {reason}"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Replaces the pages made from the configuration with ones made from `config`. The
+    /// other pages and everything about the open app stay.
+    fn rebuild(self: &Rc<Self>, config: Config) {
+        // Leaves any submenu and arranging first, so no stale button is left selected.
+        self.main_row();
+        let transition = self.stack.transition_type();
+        self.stack
+            .set_transition_type(gtk::StackTransitionType::None);
+
+        let from_config = |page: &Page| matches!(page, Page::Main | Page::Submenu(_));
+        let mut stale = Vec::new();
+        let mut child = self.stack.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let page = self
+                .stack
+                .page(&widget)
+                .name()
+                .and_then(|name| Page::from_key(&name));
+            if page.is_some_and(|page| from_config(&page)) {
+                stale.push(widget);
+            }
+        }
+        // A page that stays is shown while the others are replaced.
+        self.stack.set_visible_child_name(&Page::Power.key());
+        for widget in stale {
+            self.stack.remove(&widget);
+        }
+        self.first_tiles
+            .borrow_mut()
+            .retain(|page, _| !from_config(page));
+        self.labels
+            .borrow_mut()
+            .retain(|page, _| !from_config(page));
+        self.missing
+            .borrow_mut()
+            .retain(|(page, _)| !from_config(page));
+        self.arrangeable
+            .borrow_mut()
+            .retain(|page, _| !from_config(page));
+        self.rows.borrow_mut().retain(|row| row.root().is_some());
+
+        if config.background != self.config.borrow().background {
+            let background = background_widget(config.background.as_deref());
+            self.overlay.set_child(Some(&background));
+        }
+        *self.main.borrow_mut() = config.tiles.iter().map(Entry::from).collect();
+        *self.submenus.borrow_mut() = config
+            .submenus
+            .iter()
+            .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
+            .collect();
+        *self.config.borrow_mut() = config;
+
+        self.add_config_pages();
+        if self.width.get() > 0 {
+            self.fit_tiles(self.width.get());
+        }
+        self.stack.set_visible_child_name(&Page::Main.key());
+        self.stack.set_transition_type(transition);
+        self.main_row();
+    }
+
     /// Theater mode: the launcher full screen over the desktop.
-    fn show(&self) {
-        mode::save(Mode::Theater);
-        gnome::theater_mode();
+    fn show(self: &Rc<Self>) {
+        mode::enter_theater();
+        self.reload(false);
         self.refresh_installed();
         self.window.fullscreen();
         self.window.present();
@@ -586,8 +841,7 @@ impl Ui {
         // Back on the main row when the launcher comes back, not in the power menu.
         self.main_row();
         self.closes.cancel();
-        mode::save(Mode::Desktop);
-        gnome::restore();
+        mode::enter_desktop();
         self.window.set_visible(false);
     }
 
@@ -596,7 +850,7 @@ impl Ui {
     fn main_row(&self) {
         self.stop_arranging();
         while self.back() {}
-        match self.first_tiles.borrow().get(MAIN_PAGE) {
+        match self.first_tiles.borrow().get(&Page::Main) {
             Some(first) => first.grab_focus(),
             None => self.power_button.grab_focus(),
         };
@@ -615,8 +869,8 @@ impl Ui {
     /// Notes which main-row tile `button`, a tile of `page`, belongs to, for
     /// [`Ui::main_row_at_origin`]. The first submenu left is the one that was opened
     /// from the main row.
-    fn remember_origin(&self, page: &str, button: &gtk::Button) {
-        let origin = if page == MAIN_PAGE {
+    fn remember_origin(&self, page: &Page, button: &gtk::Button) {
+        let origin = if *page == Page::Main {
             Some(button.clone())
         } else {
             self.history
@@ -627,13 +881,23 @@ impl Ui {
         self.origin.replace(origin.map(|button| button.downgrade()));
     }
 
+    /// The pages made from the configuration: the main row and each submenu.
+    fn add_config_pages(self: &Rc<Self>) {
+        let main = self.main.borrow().clone();
+        self.add_page(Page::Main, None, &main, true);
+        let submenus = self.submenus.borrow().clone();
+        for (name, tiles) in &submenus {
+            self.add_page(Page::Submenu(name.clone()), Some(name), tiles, true);
+        }
+    }
+
     /// One row of tiles with its header, selected-tile title and key hints. The tiles of
     /// an `arrangeable` page are shown in the order the user saved for it.
     fn add_page(
         self: &Rc<Self>,
-        page: &str,
+        page: Page,
         submenu: Option<&str>,
-        tiles: &[Tile],
+        tiles: &[Entry],
         arrangeable: bool,
     ) {
         let column = gtk::Box::builder()
@@ -659,7 +923,7 @@ impl Ui {
         name.set_margin_top(44);
         let description = label("tile-description");
         description.set_margin_top(10);
-        if page == MAIN_PAGE && tiles.is_empty() {
+        if page == Page::Main && tiles.is_empty() {
             name.set_label("No tiles configured");
             description.set_label(&format!(
                 "Add tiles to {}",
@@ -668,14 +932,14 @@ impl Ui {
         }
         self.labels
             .borrow_mut()
-            .insert(page.to_owned(), (name.clone(), description.clone()));
+            .insert(page.clone(), (name.clone(), description.clone()));
         column.append(&name);
         column.append(&description);
         column.append(&self.hints(submenu.is_some(), !tiles.is_empty()));
 
         let positions = if arrangeable {
             let names: Vec<_> = tiles.iter().map(|tile| tile.name.as_str()).collect();
-            order::arrange(&names, self.saved_order.borrow().get(page))
+            order::arrange(&names, self.saved_order.borrow().get(&page.key()))
         } else {
             (0..tiles.len()).collect()
         };
@@ -683,17 +947,17 @@ impl Ui {
         for (position, index) in positions.into_iter().enumerate() {
             let tile = &tiles[index];
             let button = tile_button(tile);
-            self.check_installed(page, index, &button);
+            self.check_installed(&page, index, &button);
             if position == 0 {
                 self.first_tiles
                     .borrow_mut()
-                    .insert(page.to_owned(), button.clone());
-                self.show_tile(page, index);
+                    .insert(page.clone(), button.clone());
+                self.show_tile(&page, index);
             }
 
             let focus = gtk::EventControllerFocus::new();
             focus.connect_enter({
-                let (ui, page, index) = (self.clone(), page.to_owned(), index);
+                let (ui, page, index) = (self.clone(), page.clone(), index);
                 move |_| {
                     ui.show_tile(&page, index);
                     if ui.navigating.get() {
@@ -719,13 +983,13 @@ impl Ui {
             button.add_controller(hover);
 
             button.connect_clicked({
-                let (ui, page) = (self.clone(), page.to_owned());
+                let (ui, page) = (self.clone(), page.clone());
                 move |button| {
                     if ui.click_while_arranging(&page, button) {
                         return;
                     }
                     ui.sounds.chosen();
-                    ui.activate(&page, ui.tile(&page, index), button);
+                    ui.activate(&page, &ui.tile(&page, index), button);
                 }
             });
 
@@ -736,20 +1000,20 @@ impl Ui {
         if arrangeable {
             buttons.sort_by_key(|(index, _)| *index);
             self.arrangeable.borrow_mut().insert(
-                page.to_owned(),
+                page.clone(),
                 Arrangeable {
                     row: row.clone(),
                     buttons: buttons.into_iter().map(|(_, button)| button).collect(),
                 },
             );
         }
-        self.stack.add_named(&column, Some(page));
+        self.stack.add_named(&column, Some(&page.key()));
         self.rows.borrow_mut().push(row);
     }
 
     /// The tile with keyboard focus on the visible page, if that page can be rearranged.
-    fn focused_tile(&self) -> Option<(String, gtk::Button)> {
-        let page = self.stack.visible_child_name()?.to_string();
+    fn focused_tile(&self) -> Option<(Page, gtk::Button)> {
+        let page = self.current_page();
         let focus = GtkWindowExt::focus(&self.window)?;
         let arrangeable = self.arrangeable.borrow();
         let tiles = arrangeable.get(&page)?;
@@ -842,7 +1106,7 @@ impl Ui {
 
     /// A click on a tile while one is picked up drops it, and while arranging picks the
     /// tile up. True if the click was used for that, so it does not open the tile.
-    fn click_while_arranging(&self, page: &str, button: &gtk::Button) -> bool {
+    fn click_while_arranging(&self, page: &Page, button: &gtk::Button) -> bool {
         if self.picked.borrow().is_some() {
             self.drop_picked();
             return true;
@@ -854,7 +1118,7 @@ impl Ui {
         false
     }
 
-    fn pick_up(&self, page: &str, button: &gtk::Button) {
+    fn pick_up(&self, page: &Page, button: &gtk::Button) {
         let from = {
             let arrangeable = self.arrangeable.borrow();
             let Some(tiles) = arrangeable.get(page) else {
@@ -869,7 +1133,7 @@ impl Ui {
         };
         button.add_css_class("picked");
         self.picked.replace(Some(Picked {
-            page: page.to_owned(),
+            page: page.clone(),
             button: button.clone(),
             from,
         }));
@@ -942,15 +1206,16 @@ impl Ui {
     }
 
     /// The tile order of the page, as the row shows it now.
-    fn save_order(&self, page: &str) {
+    fn save_order(&self, page: &Page) {
         let names: Vec<order::Identity> = {
             let arrangeable = self.arrangeable.borrow();
             let Some(tiles) = arrangeable.get(page) else {
                 return;
             };
-            let configured: Vec<_> = (0..tiles.buttons.len())
-                .map(|index| self.tile(page, index).name.as_str())
+            let names: Vec<String> = (0..tiles.buttons.len())
+                .map(|index| self.tile(page, index).name)
                 .collect();
+            let configured: Vec<&str> = names.iter().map(String::as_str).collect();
             let identities = order::identities(&configured);
             children(&tiles.row)
                 .iter()
@@ -964,12 +1229,12 @@ impl Ui {
                 .collect()
         };
         let mut saved = self.saved_order.borrow_mut();
-        saved.insert(page.to_owned(), names);
+        saved.insert(page.key(), names);
         order::save(&saved);
     }
 
     /// The first tile of a page is what is selected when it opens.
-    fn refresh_first(&self, page: &str) {
+    fn refresh_first(&self, page: &Page) {
         let first = self.arrangeable.borrow().get(page).and_then(|tiles| {
             tiles
                 .row
@@ -977,7 +1242,7 @@ impl Ui {
                 .and_then(|child| child.downcast::<gtk::Button>().ok())
         });
         if let Some(first) = first {
-            self.first_tiles.borrow_mut().insert(page.to_owned(), first);
+            self.first_tiles.borrow_mut().insert(page.clone(), first);
         }
     }
 
@@ -992,7 +1257,7 @@ impl Ui {
     fn reset_order(&self) {
         order::clear();
         self.saved_order.borrow_mut().clear();
-        let pages: Vec<String> = self.arrangeable.borrow().keys().cloned().collect();
+        let pages: Vec<Page> = self.arrangeable.borrow().keys().cloned().collect();
         for page in &pages {
             if let Some(tiles) = self.arrangeable.borrow().get(page) {
                 for (index, button) in tiles.buttons.iter().enumerate() {
@@ -1002,7 +1267,7 @@ impl Ui {
             self.refresh_first(page);
         }
         self.main_row();
-        self.toasts.add_toast(adw::Toast::new("Tile order reset"));
+        self.notify("Tile order reset");
     }
 
     fn update_arrange_hint(&self) {
@@ -1022,6 +1287,7 @@ impl Ui {
     /// Sizes every row's tiles to fit a window `width` logical pixels wide, so the
     /// last tile is never pushed off a small screen.
     fn fit_tiles(&self, width: i32) {
+        self.width.set(width);
         for row in self.rows.borrow().iter() {
             let mut tiles = Vec::new();
             let mut child = row.first_child();
@@ -1054,7 +1320,7 @@ impl Ui {
         match submenu {
             None => {
                 header.append(&self.clock.greeting());
-                if let Some(title) = &self.config.title {
+                if let Some(title) = &self.config.borrow().title {
                     let subtitle = label("subtitle");
                     subtitle.set_label(title);
                     subtitle.set_halign(gtk::Align::Start);
@@ -1090,7 +1356,7 @@ impl Ui {
             if has_tiles {
                 hints.append(&hint("Enter", "Open"));
             }
-            if let Some(key) = &self.config.home_key {
+            if let Some(key) = &self.config.borrow().home_key {
                 hints.append(&hint(key, "Home (closes the open app)"));
             }
         }
@@ -1099,9 +1365,9 @@ impl Ui {
 
     /// Marks the tile `button` (tile `index` of `page`) as missing, dimmed, if its app is
     /// not installed, and as present otherwise.
-    fn check_installed(&self, page: &str, index: usize, button: &gtk::Button) {
-        let key = (page.to_owned(), index);
-        if launch::is_installed(&self.tile(page, index).action) {
+    fn check_installed(&self, page: &Page, index: usize, button: &gtk::Button) {
+        let key = (page.clone(), index);
+        if self.tile(page, index).command.is_installed() {
             self.missing.borrow_mut().remove(&key);
             button.remove_css_class("unavailable");
         } else {
@@ -1125,92 +1391,104 @@ impl Ui {
 
     /// Shows the name and description of a tile under its page's row. A tile whose app
     /// is not installed says so instead of its description.
-    fn show_tile(&self, page: &str, index: usize) {
+    fn show_tile(&self, page: &Page, index: usize) {
         let labels = self.labels.borrow();
         let Some((name, description)) = labels.get(page) else {
             return;
         };
         let tile = self.tile(page, index);
-        if self.missing.borrow().contains(&(page.to_owned(), index)) {
+        if self.missing.borrow().contains(&(page.clone(), index)) {
             name.set_label(&tile.name);
             description.set_label("Not installed");
         } else {
-            show_selected(name, description, tile);
+            show_selected(name, description, &tile);
         }
     }
 
-    fn tile(&self, page: &str, index: usize) -> &Tile {
-        let tiles = match page.strip_prefix("submenu:") {
-            Some(name) => &self.config.submenus[name],
-            None => match self.own_pages.iter().find(|own| own.key == page) {
-                Some(own) => &own.tiles,
-                None => &self.config.tiles,
-            },
-        };
-        &tiles[index]
+    fn tile(&self, page: &Page, index: usize) -> Entry {
+        match page {
+            Page::Main => self.main.borrow()[index].clone(),
+            Page::Submenu(name) => self.submenus.borrow()[name][index].clone(),
+            Page::Power | Page::Confirm(_) => self
+                .own_pages
+                .iter()
+                .find(|own| own.page == *page)
+                .expect("the launcher has a page of its own for each of its pages")
+                .tiles[index]
+                .clone(),
+        }
     }
 
     /// `page` is the page the tile is on: a shutdown or restart asks for
     /// confirmation first, so a stray key press cannot power the machine off.
-    fn activate(self: &Rc<Self>, page: &str, tile: &Tile, button: &gtk::Button) {
-        let confirming = page.starts_with(CONFIRM_PREFIX);
-        let result = match &tile.action {
-            Action::Submenu(name) => {
-                self.open(&submenu_page(name), button);
+    fn activate(self: &Rc<Self>, page: &Page, entry: &Entry, button: &gtk::Button) {
+        let confirming = matches!(page, Page::Confirm(_));
+        if !confirming {
+            if let Some(confirm) = Confirmable::of(&entry.command) {
+                self.open(Page::Confirm(confirm), button);
+                return;
+            }
+        }
+        let result = match &entry.command {
+            Command::Config(Action::Submenu(name)) => {
+                self.open(Page::Submenu(name.clone()), button);
                 Ok(())
             }
-            Action::Builtin(Builtin::DesktopMode) => {
+            Command::Config(Action::Builtin(Builtin::DesktopMode)) => {
                 self.desktop_mode();
                 Ok(())
             }
-            Action::Builtin(
-                builtin @ (Builtin::Shutdown | Builtin::Restart | Builtin::ResetOrder),
-            ) if !confirming => {
-                self.open(&confirm_page(*builtin), button);
-                Ok(())
-            }
-            Action::Builtin(Builtin::Shutdown) => self.power(tile, "poweroff"),
-            Action::Builtin(Builtin::Restart) => self.power(tile, "reboot"),
-            Action::Builtin(Builtin::Arrange) => {
+            Command::Config(Action::Builtin(Builtin::Shutdown)) => self.power(entry, "poweroff"),
+            Command::Config(Action::Builtin(Builtin::Restart)) => self.power(entry, "reboot"),
+            Command::Arrange => {
                 self.start_arranging();
                 Ok(())
             }
-            Action::Builtin(Builtin::ResetOrder) => {
+            Command::ResetOrder => {
                 self.reset_order();
                 Ok(())
             }
-            Action::Builtin(Builtin::Cancel) => {
+            Command::Cancel => {
                 self.back();
                 Ok(())
             }
             // Checked again here, not read from `missing`: the app may have been installed
             // since. Nothing is closed for an app that cannot start.
-            action if !launch::is_installed(action) => {
-                self.toasts
-                    .add_toast(adw::Toast::new(&format!("{} isn't installed", tile.name)));
+            Command::Config(Action::Command(_) | Action::Desktop(_) | Action::Flatpak(_))
+                if !entry.command.is_installed() =>
+            {
+                self.notify(&format!("{} isn't installed", entry.name));
                 Ok(())
             }
-            action => {
+            Command::Config(
+                action @ (Action::Command(_) | Action::Desktop(_) | Action::Flatpak(_)),
+            ) => {
                 self.remember_origin(page, button);
-                self.launch(tile, action);
+                self.launch(&entry.name, action);
                 Ok(())
             }
         };
         if let Err(error) = result {
-            self.failed(&tile.name, &error);
+            self.failed(&entry.name, &error);
         }
+    }
+
+    /// A message over the tiles. Plain text: names and errors in it can hold `&` or `<`,
+    /// which a toast would otherwise read as markup.
+    fn notify(&self, text: &str) {
+        self.toasts
+            .add_toast(adw::Toast::builder().title(text).use_markup(false).build());
     }
 
     fn failed(&self, name: &str, error: &anyhow::Error) {
         log::error!("{name}: {error:#}");
-        self.toasts
-            .add_toast(adw::Toast::new(&format!("Couldn't open {name}")));
+        self.notify(&format!("Couldn't open {name}"));
     }
 
     /// systemctl fails when logind refuses, e.g. while another user is logged in.
-    fn power(self: &Rc<Self>, tile: &Tile, verb: &str) -> anyhow::Result<()> {
+    fn power(self: &Rc<Self>, entry: &Entry, verb: &str) -> anyhow::Result<()> {
         let process = launch::systemctl(verb)?;
-        let (ui, name) = (self.clone(), tile.name.clone());
+        let (ui, name) = (self.clone(), entry.name.clone());
         process.wait_check_async(None::<&gio::Cancellable>, move |result| {
             if let Err(error) = result {
                 ui.failed(&name, &error.into());
@@ -1221,8 +1499,8 @@ impl Ui {
 
     /// One app at a time: the previous one is closed, and the new one starts once it
     /// is gone. A tile chosen while that is pending replaces the pending one.
-    fn launch(self: &Rc<Self>, tile: &Tile, action: &Action) {
-        self.close_then(Request::Tile(tile.name.clone(), action.clone()));
+    fn launch(self: &Rc<Self>, name: &str, action: &Action) {
+        self.close_then(Request::Tile(name.to_owned(), action.clone()));
     }
 
     /// Closes the open app (and any left by a crashed launcher), then acts on the
@@ -1246,19 +1524,16 @@ impl Ui {
             match closed {
                 Ok(()) => {}
                 Err(launch::StopError::Timeout) => {
-                    ui.toasts.add_toast(adw::Toast::new(NOT_CLOSED));
+                    ui.notify(NOT_CLOSED);
                 }
                 Err(launch::StopError::GaveUp {
                     apps,
                     others_still_running,
                 }) => {
                     log::warn!("giving up on {apps:?}: they will not close");
-                    ui.toasts.add_toast(adw::Toast::new(&format!(
-                        "{} won't close; giving up on it",
-                        apps.join(", ")
-                    )));
+                    ui.notify(&format!("{} won't close; giving up on it", apps.join(", ")));
                     if others_still_running {
-                        ui.toasts.add_toast(adw::Toast::new(NOT_CLOSED));
+                        ui.notify(NOT_CLOSED);
                     }
                 }
                 Err(launch::StopError::Unknown(launched)) => {
@@ -1266,9 +1541,7 @@ impl Ui {
                     // Choosing the tile again retries the close, still knowing the
                     // app started last (`running` is empty while a close runs).
                     ui.running.replace(launched);
-                    ui.toasts.add_toast(adw::Toast::new(
-                        "Couldn't check whether the previous app closed",
-                    ));
+                    ui.notify("Couldn't check whether the previous app closed");
                     return;
                 }
             }
@@ -1323,20 +1596,26 @@ impl Ui {
         }
     }
 
-    fn open(&self, page: &str, opener: &gtk::Button) {
-        let current = self
-            .stack
-            .visible_child_name()
-            .map_or_else(|| MAIN_PAGE.to_owned(), |name| name.to_string());
-        self.history.borrow_mut().push((current, opener.clone()));
-        self.stack.set_visible_child_name(page);
-        if let Some(first) = self.first_tiles.borrow().get(page) {
+    fn open(&self, page: Page, opener: &gtk::Button) {
+        self.history
+            .borrow_mut()
+            .push((self.current_page(), opener.clone()));
+        self.stack.set_visible_child_name(&page.key());
+        if let Some(first) = self.first_tiles.borrow().get(&page) {
             first.grab_focus();
         }
     }
 
+    /// The page being shown.
+    fn current_page(&self) -> Page {
+        self.stack
+            .visible_child_name()
+            .and_then(|name| Page::from_key(&name))
+            .unwrap_or(Page::Main)
+    }
+
     fn on_main_page(&self) -> bool {
-        self.stack.visible_child_name().as_deref() == Some(MAIN_PAGE)
+        self.current_page() == Page::Main
     }
 
     /// Returns to the page this submenu was opened from; false on the main page.
@@ -1344,7 +1623,7 @@ impl Ui {
         let Some((page, opener)) = self.history.borrow_mut().pop() else {
             return false;
         };
-        self.stack.set_visible_child_name(&page);
+        self.stack.set_visible_child_name(&page.key());
         opener.grab_focus();
         true
     }
@@ -1477,23 +1756,19 @@ fn row_layout(width: i32, count: usize) -> (i32, i32) {
     (size.clamp(1, TILE_MIN), TILE_MIN_SPACING)
 }
 
-fn submenu_page(name: &str) -> String {
-    format!("submenu:{name}")
-}
-
 /// A page the launcher adds itself: the power menu and its confirmations.
 struct OwnPage {
-    key: &'static str,
+    page: Page,
     title: &'static str,
-    tiles: Vec<Tile>,
+    tiles: Vec<Entry>,
 }
 
-fn builtin_tile(name: &str, icon: &str, description: &str, builtin: Builtin) -> Tile {
-    Tile {
+fn entry(name: &str, icon: &str, description: &str, command: Command) -> Entry {
+    Entry {
         name: name.to_owned(),
         icon: Some(icon.to_owned()),
         description: Some(description.to_owned()),
-        action: Action::Builtin(builtin),
+        command,
     }
 }
 
@@ -1501,101 +1776,90 @@ fn builtin_tile(name: &str, icon: &str, description: &str, builtin: Builtin) -> 
 /// off. Cancel comes first, so it is what is selected when a confirmation opens.
 fn own_pages() -> Vec<OwnPage> {
     let cancel = || {
-        builtin_tile(
+        entry(
             "Cancel",
             "window-close-symbolic",
             "Go back",
-            Builtin::Cancel,
+            Command::Cancel,
         )
     };
     vec![
         OwnPage {
-            key: POWER_PAGE,
+            page: Page::Power,
             title: "Power",
             tiles: vec![
-                builtin_tile(
+                entry(
                     "Desktop Mode",
                     "video-display-symbolic",
                     "Hide the launcher and show the GNOME desktop",
-                    Builtin::DesktopMode,
+                    Command::Config(Action::Builtin(Builtin::DesktopMode)),
                 ),
-                builtin_tile(
+                entry(
                     "Arrange Tiles",
                     "view-list-symbolic",
                     "Pick tiles up and move them",
-                    Builtin::Arrange,
+                    Command::Arrange,
                 ),
-                builtin_tile(
+                entry(
                     "Reset Tile Order",
                     "edit-undo-symbolic",
                     "Put the tiles back in the configured order",
-                    Builtin::ResetOrder,
+                    Command::ResetOrder,
                 ),
-                builtin_tile(
+                entry(
                     "Restart",
                     "system-reboot-symbolic",
                     "Restart the HTPC",
-                    Builtin::Restart,
+                    Command::Config(Action::Builtin(Builtin::Restart)),
                 ),
-                builtin_tile(
+                entry(
                     "Shutdown",
                     "system-shutdown-symbolic",
                     "Turn the HTPC off",
-                    Builtin::Shutdown,
+                    Command::Config(Action::Builtin(Builtin::Shutdown)),
                 ),
             ],
         },
         OwnPage {
-            key: "confirm:reset",
+            page: Page::Confirm(Confirmable::ResetOrder),
             title: "Reset tile order?",
             tiles: vec![
                 cancel(),
-                builtin_tile(
+                entry(
                     "Reset",
                     "edit-undo-symbolic",
                     "Use the configured tile order again",
-                    Builtin::ResetOrder,
+                    Command::ResetOrder,
                 ),
             ],
         },
         OwnPage {
-            key: "confirm:shutdown",
+            page: Page::Confirm(Confirmable::Shutdown),
             title: "Shut down?",
             tiles: vec![
                 cancel(),
-                builtin_tile(
+                entry(
                     "Shut down",
                     "system-shutdown-symbolic",
                     "Turn the HTPC off now",
-                    Builtin::Shutdown,
+                    Command::Config(Action::Builtin(Builtin::Shutdown)),
                 ),
             ],
         },
         OwnPage {
-            key: "confirm:restart",
+            page: Page::Confirm(Confirmable::Restart),
             title: "Restart?",
             tiles: vec![
                 cancel(),
-                builtin_tile(
+                entry(
                     "Restart",
                     "system-reboot-symbolic",
                     "Restart the HTPC now",
-                    Builtin::Restart,
+                    Command::Config(Action::Builtin(Builtin::Restart)),
                 ),
             ],
         },
     ]
-}
-
-/// The page asking whether to go ahead with `builtin`: a shutdown, restart or reset of
-/// the tile order.
-fn confirm_page(builtin: Builtin) -> String {
-    let action = match builtin {
-        Builtin::Restart => "restart",
-        Builtin::ResetOrder => "reset",
-        _ => "shutdown",
-    };
-    format!("{CONFIRM_PREFIX}{action}")
 }
 
 /// Top-right, next to the clock: the way into the power menu.
@@ -1612,6 +1876,23 @@ fn power_button() -> gtk::Button {
     button
 }
 
+/// The picture behind the tiles, or a plain dark background without one.
+fn background_widget(path: Option<&std::path::Path>) -> gtk::Widget {
+    match path {
+        Some(path) => gtk::Picture::builder()
+            .file(&gio::File::for_path(path))
+            .content_fit(gtk::ContentFit::Cover)
+            .can_shrink(true)
+            .build()
+            .upcast(),
+        None => {
+            let plain = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            plain.add_css_class("plain-background");
+            plain.upcast()
+        }
+    }
+}
+
 /// Shown for a tile whose icon cannot be found.
 const PLACEHOLDER_ICON: &str = "application-x-executable";
 
@@ -1620,7 +1901,7 @@ const PLACEHOLDER_ICON: &str = "application-x-executable";
 /// application id. An icon that cannot be found (no desktop file, no icon in it, a name
 /// the icon theme lacks, a file that is not there) shows [`PLACEHOLDER_ICON`] and logs
 /// a warning, so a tile is never blank.
-fn tile_image(tile: &Tile) -> gtk::Image {
+fn tile_image(tile: &Entry) -> gtk::Image {
     let theme = gtk::gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display));
     match find_icon(tile, theme.as_ref()) {
         Ok(icon) => gtk::Image::from_gicon(&icon),
@@ -1634,17 +1915,17 @@ fn tile_image(tile: &Tile) -> gtk::Image {
     }
 }
 
-fn find_icon(tile: &Tile, theme: Option<&gtk::IconTheme>) -> Result<gio::Icon, String> {
-    let icon: gio::Icon = match (&tile.icon, &tile.action) {
+fn find_icon(tile: &Entry, theme: Option<&gtk::IconTheme>) -> Result<gio::Icon, String> {
+    let icon: gio::Icon = match (&tile.icon, &tile.command) {
         (Some(icon), _) if icon.starts_with('/') => {
             gio::FileIcon::new(&gio::File::for_path(icon)).upcast()
         }
         (Some(icon), _) => gio::ThemedIcon::new(icon).upcast(),
-        (None, Action::Desktop(id)) => gio::DesktopAppInfo::new(id)
+        (None, Command::Config(Action::Desktop(id))) => gio::DesktopAppInfo::new(id)
             .ok_or_else(|| format!("no desktop file {id}"))?
             .icon()
             .ok_or_else(|| format!("{id} names no icon"))?,
-        (None, Action::Flatpak(id)) => gio::ThemedIcon::new(id).upcast(),
+        (None, Command::Config(Action::Flatpak(id))) => gio::ThemedIcon::new(id).upcast(),
         (None, _) => return Err("no icon".into()),
     };
     if icon_resolves(&icon, theme) {
@@ -1674,7 +1955,7 @@ fn icon_resolves(icon: &gio::Icon, theme: Option<&gtk::IconTheme>) -> bool {
     true
 }
 
-fn tile_button(tile: &Tile) -> gtk::Button {
+fn tile_button(tile: &Entry) -> gtk::Button {
     let icon = tile_image(tile);
     icon.set_pixel_size(ICON_SIZE);
 
@@ -1691,35 +1972,25 @@ fn tile_button(tile: &Tile) -> gtk::Button {
     button
 }
 
-fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Tile) {
+fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
     name.set_label(&tile.name);
     description.set_label(tile.description.as_deref().unwrap_or(""));
-}
-
-pub fn label(class: &str) -> gtk::Label {
-    gtk::Label::builder().css_classes([class]).build()
-}
-
-/// A key cap followed by what the key does.
-fn hint(key: &str, action: &str) -> gtk::Box {
-    let hint = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    hint.add_css_class("hint");
-    let cap = label("keycap");
-    cap.set_label(key);
-    let text = gtk::Label::new(Some(action));
-    hint.append(&cap);
-    hint.append(&text);
-    hint
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_page, is_back, is_enter, is_navigation, own_pages, row_layout, CloseQueue,
-        CONFIRM_PREFIX, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
+        is_back, is_enter, is_navigation, own_pages, row_layout, CloseQueue, Command, Confirmable,
+        Page, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
+
+    const ALL_CONFIRMABLE: [Confirmable; 3] = [
+        Confirmable::Shutdown,
+        Confirmable::Restart,
+        Confirmable::ResetOrder,
+    ];
 
     #[test]
     fn only_the_keys_that_move_the_selection_are_navigation() {
@@ -1818,34 +2089,155 @@ mod tests {
     #[test]
     fn the_power_menu_offers_desktop_mode_arranging_reset_restart_and_shutdown() {
         let pages = own_pages();
-        let power = pages
-            .iter()
-            .find(|page| page.key == super::POWER_PAGE)
-            .unwrap();
-        let actions: Vec<_> = power.tiles.iter().map(|tile| &tile.action).collect();
+        let power = pages.iter().find(|own| own.page == Page::Power).unwrap();
+        let commands: Vec<_> = power.tiles.iter().map(|tile| &tile.command).collect();
         assert_eq!(
-            actions,
+            commands,
             [
-                &Action::Builtin(Builtin::DesktopMode),
-                &Action::Builtin(Builtin::Arrange),
-                &Action::Builtin(Builtin::ResetOrder),
-                &Action::Builtin(Builtin::Restart),
-                &Action::Builtin(Builtin::Shutdown),
+                &Command::Config(Action::Builtin(Builtin::DesktopMode)),
+                &Command::Arrange,
+                &Command::ResetOrder,
+                &Command::Config(Action::Builtin(Builtin::Restart)),
+                &Command::Config(Action::Builtin(Builtin::Shutdown)),
             ]
         );
+    }
+
+    /// The command of the tile that goes ahead with `confirm`.
+    fn go_ahead(confirm: Confirmable) -> Command {
+        match confirm {
+            Confirmable::Shutdown => Command::Config(Action::Builtin(Builtin::Shutdown)),
+            Confirmable::Restart => Command::Config(Action::Builtin(Builtin::Restart)),
+            Confirmable::ResetOrder => Command::ResetOrder,
+        }
     }
 
     #[test]
     fn every_power_off_or_reset_action_has_a_confirmation_that_selects_cancel_first() {
         let pages = own_pages();
-        for builtin in [Builtin::Shutdown, Builtin::Restart, Builtin::ResetOrder] {
-            let key = confirm_page(builtin);
-            assert!(key.starts_with(CONFIRM_PREFIX));
-            let page = pages.iter().find(|page| page.key == key).unwrap();
-            assert_eq!(page.tiles[0].action, Action::Builtin(Builtin::Cancel));
-            assert_eq!(page.tiles[1].action, Action::Builtin(builtin));
+        for confirm in ALL_CONFIRMABLE {
+            // What asks for the confirmation is what the confirmation then goes ahead with.
+            assert_eq!(Confirmable::of(&go_ahead(confirm)), Some(confirm));
+            let page = pages
+                .iter()
+                .find(|own| own.page == Page::Confirm(confirm))
+                .unwrap();
+            assert_eq!(page.tiles[0].command, Command::Cancel);
+            assert_eq!(page.tiles[1].command, go_ahead(confirm));
             assert_eq!(page.tiles.len(), 2);
         }
+    }
+
+    #[test]
+    fn only_the_commands_that_discard_or_power_off_need_a_confirmation() {
+        let config = |action| Command::Config(action);
+        for (command, needs) in [
+            (config(Action::Builtin(Builtin::Shutdown)), true),
+            (config(Action::Builtin(Builtin::Restart)), true),
+            (Command::ResetOrder, true),
+            (config(Action::Builtin(Builtin::DesktopMode)), false),
+            (config(Action::Command("mpv".into())), false),
+            (config(Action::Desktop("a.desktop".into())), false),
+            (config(Action::Flatpak("a.b".into())), false),
+            (config(Action::Submenu("Games".into())), false),
+            (Command::Cancel, false),
+            (Command::Arrange, false),
+        ] {
+            assert_eq!(Confirmable::of(&command).is_some(), needs, "{command:?}");
+        }
+    }
+
+    // The launcher adds exactly one page for the power menu and for each confirmation,
+    // and none other, so `Ui::tile` always finds the page of its own.
+    #[test]
+    fn the_launcher_has_one_page_of_its_own_for_each_of_its_pages() {
+        let pages: Vec<_> = own_pages().into_iter().map(|own| own.page).collect();
+        let mut expected = vec![Page::Power];
+        expected.extend(
+            [
+                Confirmable::Shutdown,
+                Confirmable::Restart,
+                Confirmable::ResetOrder,
+            ]
+            .map(Page::Confirm),
+        );
+        for page in &expected {
+            assert_eq!(pages.iter().filter(|p| *p == page).count(), 1, "{page:?}");
+        }
+        assert_eq!(pages.len(), expected.len());
+    }
+
+    // `order.json` files and the stack name pages by these strings, so they are fixed.
+    #[test]
+    fn page_keys_are_the_names_existing_files_hold() {
+        assert_eq!(Page::Main.key(), "main");
+        assert_eq!(Page::Power.key(), "power");
+        assert_eq!(Page::Submenu("Games".into()).key(), "submenu:Games");
+        assert_eq!(
+            Page::Confirm(Confirmable::Shutdown).key(),
+            "confirm:shutdown"
+        );
+        assert_eq!(Page::Confirm(Confirmable::Restart).key(), "confirm:restart");
+        assert_eq!(
+            Page::Confirm(Confirmable::ResetOrder).key(),
+            "confirm:reset"
+        );
+    }
+
+    #[test]
+    fn a_page_is_found_again_from_its_key() {
+        let mut pages = vec![Page::Main, Page::Power];
+        // Submenu names are the user's, whatever they hold.
+        for name in [
+            "Games",
+            "a:b",
+            "",
+            "main",
+            "power",
+            "confirm:shutdown",
+            "submenu:x",
+        ] {
+            pages.push(Page::Submenu(name.to_owned()));
+        }
+        pages.extend(
+            [
+                Confirmable::Shutdown,
+                Confirmable::Restart,
+                Confirmable::ResetOrder,
+            ]
+            .map(Page::Confirm),
+        );
+        for page in pages {
+            assert_eq!(Page::from_key(&page.key()), Some(page.clone()), "{page:?}");
+        }
+        for key in ["", "nope", "confirm:", "confirm:sleep", "Main"] {
+            assert_eq!(Page::from_key(key), None, "{key:?}");
+        }
+    }
+
+    // An `order.json` written before pages were typed, by the launcher itself, still
+    // applies: its keys are the ones `Page::key` gives.
+    #[test]
+    fn an_order_file_saved_before_pages_were_typed_still_applies() {
+        let saved: crate::order::Saved = serde_json::from_str(
+            r#"{"main":[["B",0],["A",0],["Games",0]],"submenu:Games":[["Y",0],["X",0]]}"#,
+        )
+        .unwrap();
+        let main = saved.get(&Page::Main.key());
+        assert_eq!(crate::order::arrange(&["A", "B", "Games"], main), [1, 0, 2]);
+        let games = saved.get(&Page::Submenu("Games".into()).key());
+        assert_eq!(crate::order::arrange(&["X", "Y"], games), [1, 0]);
+    }
+
+    // A reload waits while a close runs, so the queue says whether one does.
+    #[test]
+    fn the_queue_says_whether_a_close_is_running() {
+        let queue = CloseQueue::new();
+        assert!(!queue.is_busy());
+        assert!(queue.submit("brave"));
+        assert!(queue.is_busy());
+        queue.finish();
+        assert!(!queue.is_busy());
     }
 
     #[test]
