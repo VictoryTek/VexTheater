@@ -175,7 +175,7 @@ thread_local! {
 pub fn command_line(
     application: &adw::Application,
     command_line: &gio::ApplicationCommandLine,
-) -> i32 {
+) -> glib::ExitCode {
     let arguments = command_line.arguments();
     let flags: Vec<_> = arguments
         .iter()
@@ -185,7 +185,7 @@ pub fn command_line(
     match flags.as_slice() {
         [] => {
             activate(application);
-            0
+            glib::ExitCode::SUCCESS
         }
         // What the autostart service runs: like no flag, but a launcher restarted
         // after a crash in desktop mode stays in desktop mode.
@@ -195,25 +195,25 @@ pub fn command_line(
             } else {
                 activate(application);
             }
-            0
+            glib::ExitCode::SUCCESS
         }
         [flag] if flag == "--home" => {
             if let Some(ui) = ui(application) {
                 ui.home();
             }
-            0
+            glib::ExitCode::SUCCESS
         }
         [flag] if flag == "--desktop" => {
             if let Some(ui) = ui(application) {
                 ui.desktop_mode();
             }
-            0
+            glib::ExitCode::SUCCESS
         }
         [flag] if flag == "--reload" => {
             if let Some(ui) = ui(application) {
                 ui.reload(true);
             }
-            0
+            glib::ExitCode::SUCCESS
         }
         // Theater mode if the launcher is hidden, desktop mode if it is shown, so one
         // key can switch between them.
@@ -225,7 +225,7 @@ pub fn command_line(
                     ui.show();
                 }
             }
-            0
+            glib::ExitCode::SUCCESS
         }
         _ => {
             command_line.printerr_literal(
@@ -237,7 +237,7 @@ pub fn command_line(
                  --resume  show the launcher, unless it crashed in desktop mode\n  \
                  --check-config [FILE]  check a configuration file and exit (first argument)\n",
             );
-            2
+            glib::ExitCode::from(2)
         }
     }
 }
@@ -1927,7 +1927,7 @@ fn find_icon(tile: &Entry, theme: Option<&gtk::IconTheme>) -> Result<gio::Icon, 
             gio::FileIcon::new(&gio::File::for_path(icon)).upcast()
         }
         (Some(icon), _) => gio::ThemedIcon::new(icon).upcast(),
-        (None, Command::Config(Action::Desktop(id))) => gio::DesktopAppInfo::new(id)
+        (None, Command::Config(Action::Desktop(id))) => gio_unix::DesktopAppInfo::new(id)
             .ok_or_else(|| format!("no desktop file {id}"))?
             .icon()
             .ok_or_else(|| format!("{id} names no icon"))?,

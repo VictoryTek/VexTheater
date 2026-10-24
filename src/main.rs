@@ -56,7 +56,7 @@ fn main() -> glib::ExitCode {
     });
     for signal in [libc::SIGINT, libc::SIGTERM] {
         let application = application.clone();
-        glib::unix_signal_add_local(signal, move || {
+        glib_unix::unix_signal_add_local(signal, move || {
             application.quit();
             glib::ControlFlow::Break
         });

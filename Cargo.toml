@@ -8,10 +8,13 @@ repository = "https://github.com/VictoryTek/VexTheater"
 description = "A full-screen TV launcher for GNOME"
 
 [dependencies]
-gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
-adw = { version = "0.7", package = "libadwaita", features = ["v1_6"] }
-glib = "0.20"
-gio = { version = "0.20", features = ["v2_80"] }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_6"] }
+glib = "0.22"
+gio = { version = "0.22", features = ["v2_80"] }
+# GLib and Gio's Unix-only parts, split out of glib and gio in 0.22.
+gio-unix = "0.22"
+glib-unix = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -20,7 +23,7 @@ env_logger = "0.11"
 libc = "0.2"
 
 [build-dependencies]
-glib-build-tools = "0.20"
+glib-build-tools = "0.22"
 
 [profile.release]
 opt-level = "s"

@@ -135,7 +135,7 @@ same user's `$VEXTHEATER_CONFIG`).
   → verify: a NixOS VM test or a check of the generated dconf database; `nix build path:.`.
 
 ### Batch 3.12: Upgrade the gtk-rs stack (Tier 3, M)
-- [ ] **A5**: upgrade gtk4, libadwaita, glib, gio and glib-build-tools together, reading the gtk-rs 0.10 and 0.11 release notes first. Optionally use `gtk::glib` and `gtk::gio` and drop the direct glib/gio dependencies. Check that the nixpkgs GTK and libadwaita versions meet the new crates' minimum versions.
+- [x] **A5**: upgrade gtk4, libadwaita, glib, gio and glib-build-tools together, reading the gtk-rs 0.10 and 0.11 release notes first. Optionally use `gtk::glib` and `gtk::gio` and drop the direct glib/gio dependencies. Check that the nixpkgs GTK and libadwaita versions meet the new crates' minimum versions.
   → verify: build, `cargo test`, clippy, `cargo audit`, `nix build path:.`, and screenshots at both resolutions.
 
 ### Batch 3.13: Split `window.rs` (Tier 2, M–L), do after 3.7

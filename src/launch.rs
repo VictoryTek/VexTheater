@@ -113,7 +113,7 @@ fn start_with(action: &Action, env: &Env) -> anyhow::Result<Running> {
             env,
         ),
         Action::Desktop(id) => {
-            let info = gio::DesktopAppInfo::new(id)
+            let info = gio_unix::DesktopAppInfo::new(id)
                 .with_context(|| format!("no installed application has the id {id}"))?;
             let exec = info
                 .commandline()
@@ -133,7 +133,7 @@ fn start_with(action: &Action, env: &Env) -> anyhow::Result<Running> {
 /// included, is taken as runnable.
 pub fn is_installed(action: &Action) -> bool {
     match action {
-        Action::Desktop(id) => gio::DesktopAppInfo::new(id).is_some(),
+        Action::Desktop(id) => gio_unix::DesktopAppInfo::new(id).is_some(),
         Action::Flatpak(id) => flatpak_installed(id, &flatpak_app_dirs()),
         _ => true,
     }
@@ -155,7 +155,7 @@ fn flatpak_installed(id: &str, app_dirs: &[PathBuf]) -> bool {
     if id.is_empty() || id.contains('/') {
         return false;
     }
-    gio::DesktopAppInfo::new(&format!("{id}.desktop")).is_some()
+    gio_unix::DesktopAppInfo::new(&format!("{id}.desktop")).is_some()
         || app_dirs.iter().any(|dir| dir.join(id).is_dir())
 }
 
