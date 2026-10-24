@@ -21,12 +21,17 @@ const TILE_SPACING: i32 = 40;
 /// Tiles are this big when the screen has room, and shrink to fit the row on it.
 const TILE_MAX: i32 = 200;
 const TILE_MIN: i32 = 100;
+/// The least gap between tiles of a long row, wide enough for a focused tile, which is
+/// drawn larger, not to cover its neighbours much.
+const TILE_MIN_SPACING: i32 = 16;
 const ICON_SIZE: i32 = 96;
 const LOGO_WIDTH: i32 = 200;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
 const QUICK_FAILURE: Duration = Duration::from_secs(5);
 /// Holding Enter on a tile this long picks it up.
 const LONG_PRESS: Duration = Duration::from_millis(600);
+/// Shown when the previous app was still running at the time limit.
+const NOT_CLOSED: &str = "Couldn't close the previous app";
 const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
 const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  Back  done";
 
@@ -34,8 +39,8 @@ thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
 }
 
-/// Handles `vextheater` and `vextheater --home`, run here or forwarded from another
-/// process to this, the running instance.
+/// Handles `vextheater` and its flags, run here or forwarded from another process to
+/// this, the running instance.
 pub fn command_line(
     application: &adw::Application,
     command_line: &gio::ApplicationCommandLine,
@@ -67,11 +72,32 @@ pub fn command_line(
             }
             0
         }
+        [flag] if flag == "--desktop" => {
+            if let Some(ui) = ui(application) {
+                ui.desktop_mode();
+            }
+            0
+        }
+        // Theater mode if the launcher is hidden, desktop mode if it is shown, so one
+        // key can switch between them.
+        [flag] if flag == "--toggle" => {
+            if let Some(ui) = ui(application) {
+                if ui.window.is_visible() {
+                    ui.desktop_mode();
+                } else {
+                    ui.show();
+                }
+            }
+            0
+        }
         _ => {
             command_line.printerr_literal(
-                "usage: vextheater [--home | --resume]\n  \
+                "usage: vextheater [--home | --desktop | --toggle | --resume | --check-config [FILE]]\n  \
                  --home    close the open app and show the launcher\n  \
-                 --resume  show the launcher, unless it crashed in desktop mode\n",
+                 --desktop hide the launcher and show the GNOME desktop\n  \
+                 --toggle  show the launcher if it is hidden, else hide it\n  \
+                 --resume  show the launcher, unless it crashed in desktop mode\n  \
+                 --check-config [FILE]  check a configuration file and exit (first argument)\n",
             );
             2
         }
@@ -86,20 +112,25 @@ pub fn activate(application: &adw::Application) {
 }
 
 /// The launcher, built on first use. None when the configuration cannot be read; the
-/// window then shows the error instead.
+/// window then shows the error instead, and every later call reads the configuration
+/// again, so fixing the file and asking again brings the launcher up.
 fn ui(application: &adw::Application) -> Option<Rc<Ui>> {
     if let Some(ui) = UI.with_borrow(Clone::clone) {
         return Some(ui);
     }
-    if let Some(window) = application.windows().first() {
-        window.present();
-        return None;
-    }
-
-    let window = adw::ApplicationWindow::builder()
-        .application(application)
-        .title("VexTheater")
-        .build();
+    // Only the error page leaves a window without a `Ui`, so a window already there
+    // means the configuration is being read again after an error.
+    let earlier_error = application
+        .windows()
+        .first()
+        .and_then(|window| window.downcast_ref::<adw::ApplicationWindow>().cloned());
+    let retried = earlier_error.is_some();
+    let window = earlier_error.unwrap_or_else(|| {
+        adw::ApplicationWindow::builder()
+            .application(application)
+            .title("VexTheater")
+            .build()
+    });
 
     match Config::load_default() {
         Ok(config) => {
@@ -109,18 +140,84 @@ fn ui(application: &adw::Application) -> Option<Rc<Ui>> {
         }
         Err(error) => {
             log::error!("{error:#}");
-            window.set_content(Some(
-                &adw::StatusPage::builder()
-                    .icon_name("dialog-error-symbolic")
-                    .title("Configuration error")
-                    .description(format!("{error:#}"))
-                    .build(),
-            ));
-            window.fullscreen();
-            window.present();
+            show_error(application, &window, &error, retried);
             None
         }
     }
+}
+
+/// The configuration error, with a way out: try again, or leave for the desktop. A
+/// `retried` error says it is still there and when it was last checked, so a retry that
+/// changes nothing can be told from one that did not run.
+fn show_error(
+    application: &adw::Application,
+    window: &adw::ApplicationWindow,
+    error: &anyhow::Error,
+    retried: bool,
+) {
+    let retry = gtk::Button::builder()
+        .label("Retry")
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    retry.connect_clicked({
+        let application = application.clone();
+        move |_| activate(&application)
+    });
+    let desktop = gtk::Button::builder()
+        .label("Desktop Mode")
+        .css_classes(["pill"])
+        .build();
+    desktop.connect_clicked({
+        let window = window.clone();
+        move |_| {
+            mode::save(Mode::Desktop);
+            window.set_visible(false);
+        }
+    });
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(24)
+        .halign(gtk::Align::Center)
+        .build();
+    buttons.append(&retry);
+    buttons.append(&desktop);
+
+    let page = adw::StatusPage::builder()
+        .icon_name("dialog-error-symbolic")
+        .title("Configuration error")
+        // The description is markup, and tile names and paths can hold `&` or `<`.
+        .description(glib::markup_escape_text(&if retried {
+            let checked = glib::DateTime::now_local()
+                .and_then(|now| now.format("%H:%M:%S"))
+                .map(|time| format!(" (checked {time})"))
+                .unwrap_or_default();
+            format!("Still invalid{checked}:\n{error:#}")
+        } else {
+            format!("{error:#}")
+        }))
+        .child(&buttons)
+        .build();
+    // On the page, not the window: each failed retry replaces the page and its controllers.
+    hide_idle_pointer(&page, |_| {});
+    // GTK buttons ignore a remote's select key, which is how the buttons are reached.
+    let keys = gtk::EventControllerKey::new();
+    keys.connect_key_pressed({
+        let window = window.clone();
+        move |_, key, _, _| {
+            if !is_select(key) {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(focus) = GtkWindowExt::focus(&window) {
+                focus.activate();
+            }
+            glib::Propagation::Stop
+        }
+    });
+    page.add_controller(keys);
+    window.set_content(Some(&page));
+    window.fullscreen();
+    window.present();
+    retry.grab_focus();
 }
 
 /// What to do once the open app is closed.
@@ -186,6 +283,11 @@ struct Ui {
     toasts: adw::ToastOverlay,
     /// The app started from a tile, if it is still running.
     running: RefCell<Option<launch::Running>>,
+    /// The main-row tile that led to `running`: the tile itself, or the one that opens
+    /// the submenu it is in. Selected when the launcher comes back; kept in memory only.
+    origin: RefCell<Option<glib::WeakRef<gtk::Button>>>,
+    /// The round button beside the clock, selected when the main row has no tiles.
+    power_button: gtk::Button,
     /// Serialises closes; see `close_then`.
     closes: CloseQueue<Request>,
     stack: gtk::Stack,
@@ -304,6 +406,8 @@ impl Ui {
             window: window.clone(),
             toasts,
             running: RefCell::default(),
+            origin: RefCell::default(),
+            power_button: power_button.clone(),
             closes: CloseQueue::new(),
             stack,
             own_pages: own_pages(),
@@ -354,7 +458,20 @@ impl Ui {
         keys.connect_key_pressed({
             let ui = ui.clone();
             move |_, key, _, _| match key {
-                gtk::gdk::Key::Escape | gtk::gdk::Key::BackSpace if ui.back() => {
+                key if is_back(key) && ui.back() => {
+                    ui.sounds.chosen();
+                    glib::Propagation::Stop
+                }
+                // GTK buttons activate on Enter and space, not on a remote's select key.
+                key if is_select(key) => {
+                    if let Some(focus) = GtkWindowExt::focus(&ui.window) {
+                        focus.activate();
+                    }
+                    glib::Propagation::Stop
+                }
+                // A remote's home button, when GNOME leaves it to the launcher.
+                gtk::gdk::Key::HomePage => {
+                    ui.main_row();
                     ui.sounds.chosen();
                     glib::Propagation::Stop
                 }
@@ -430,10 +547,13 @@ impl Ui {
             }
         });
 
-        ui.hide_idle_pointer(window);
+        hide_idle_pointer(window, {
+            let ui = ui.clone();
+            move |visible| ui.pointer_visible.set(visible)
+        });
         window.set_content(Some(&ui.toasts));
         let first = ui.first_tiles.borrow().get(MAIN_PAGE).cloned();
-        GtkWindowExt::set_focus(window, first.as_ref());
+        GtkWindowExt::set_focus(window, first.as_ref().or(Some(&ui.power_button)));
         ui
     }
 
@@ -449,7 +569,7 @@ impl Ui {
     /// and returns to the main row.
     fn home(self: &Rc<Self>) {
         self.close_then(Request::Home);
-        self.main_row();
+        self.main_row_at_origin();
         self.show();
     }
 
@@ -465,13 +585,39 @@ impl Ui {
     }
 
     /// Leaves every submenu and selects the first tile, not the power button a
-    /// submenu may have been opened from.
+    /// submenu may have been opened from. With no tiles, the power button.
     fn main_row(&self) {
         self.stop_arranging();
         while self.back() {}
-        if let Some(first) = self.first_tiles.borrow().get(MAIN_PAGE) {
-            first.grab_focus();
+        match self.first_tiles.borrow().get(MAIN_PAGE) {
+            Some(first) => first.grab_focus(),
+            None => self.power_button.grab_focus(),
+        };
+    }
+
+    /// Like [`Ui::main_row`], but selects the tile that led to the app that was open,
+    /// if there was one; the app is gone or going, so it is forgotten.
+    fn main_row_at_origin(&self) {
+        self.main_row();
+        let origin = self.origin.take().and_then(|origin| origin.upgrade());
+        if let Some(button) = origin {
+            button.grab_focus();
         }
+    }
+
+    /// Notes which main-row tile `button`, a tile of `page`, belongs to, for
+    /// [`Ui::main_row_at_origin`]. The first submenu left is the one that was opened
+    /// from the main row.
+    fn remember_origin(&self, page: &str, button: &gtk::Button) {
+        let origin = if page == MAIN_PAGE {
+            Some(button.clone())
+        } else {
+            self.history
+                .borrow()
+                .first()
+                .map(|(_, opener)| opener.clone())
+        };
+        self.origin.replace(origin.map(|button| button.downgrade()));
     }
 
     /// One row of tiles with its header, selected-tile title and key hints. The tiles of
@@ -506,9 +652,16 @@ impl Ui {
         name.set_margin_top(44);
         let description = label("tile-description");
         description.set_margin_top(10);
+        if page == MAIN_PAGE && tiles.is_empty() {
+            name.set_label("No tiles configured");
+            description.set_label(&format!(
+                "Add tiles to {}",
+                Config::default_path().display()
+            ));
+        }
         column.append(&name);
         column.append(&description);
-        column.append(&self.hints(submenu.is_some()));
+        column.append(&self.hints(submenu.is_some(), !tiles.is_empty()));
 
         let positions = if arrangeable {
             let names: Vec<_> = tiles.iter().map(|tile| tile.name.as_str()).collect();
@@ -608,7 +761,7 @@ impl Ui {
                 Key::Left => self.move_picked(-1),
                 Key::Right => self.move_picked(1),
                 Key::Menu | Key::F2 => self.drop_picked(),
-                Key::Escape | Key::BackSpace => self.cancel_picked(),
+                key if is_back(key) => self.cancel_picked(),
                 // The picked tile keeps the selection.
                 Key::Up | Key::Down | Key::Tab | Key::ISO_Left_Tab => {}
                 _ => return false,
@@ -623,7 +776,7 @@ impl Ui {
                 }
                 None => false,
             },
-            Key::Escape | Key::BackSpace if self.arranging.get() && self.on_main_page() => {
+            key if is_back(key) && self.arranging.get() && self.on_main_page() => {
                 self.stop_arranging();
                 self.sounds.chosen();
                 true
@@ -866,7 +1019,8 @@ impl Ui {
                 child = tile.next_sibling();
                 tiles.push(tile);
             }
-            let size = tile_size(width, tiles.len());
+            let (size, spacing) = row_layout(width, tiles.len());
+            row.set_spacing(spacing);
             for tile in tiles {
                 tile.set_size_request(size, size);
                 if let Some(icon) = tile
@@ -908,18 +1062,24 @@ impl Ui {
         header
     }
 
-    fn hints(&self, in_submenu: bool) -> gtk::Box {
+    /// The key hints under a page; without `has_tiles` there is nothing to move over or
+    /// open.
+    fn hints(&self, in_submenu: bool, has_tiles: bool) -> gtk::Box {
         let hints = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(32)
             .margin_top(48)
             .build();
-        hints.append(&hint("← →", "Move"));
+        if has_tiles {
+            hints.append(&hint("← →", "Move"));
+        }
         if in_submenu {
             hints.append(&hint("Enter", "Select"));
             hints.append(&hint("Esc", "Back"));
         } else {
-            hints.append(&hint("Enter", "Open"));
+            if has_tiles {
+                hints.append(&hint("Enter", "Open"));
+            }
             if let Some(key) = &self.config.home_key {
                 hints.append(&hint(key, "Home (closes the open app)"));
             }
@@ -972,6 +1132,7 @@ impl Ui {
                 Ok(())
             }
             action => {
+                self.remember_origin(page, button);
                 self.launch(tile, action);
                 Ok(())
             }
@@ -1025,15 +1186,21 @@ impl Ui {
             let request = ui.closes.finish();
             match closed {
                 Ok(()) => {}
-                Err(launch::StopError::Timeout) => ui
-                    .toasts
-                    .add_toast(adw::Toast::new("Couldn't close the previous app")),
-                Err(launch::StopError::GaveUp(apps)) => {
+                Err(launch::StopError::Timeout) => {
+                    ui.toasts.add_toast(adw::Toast::new(NOT_CLOSED));
+                }
+                Err(launch::StopError::GaveUp {
+                    apps,
+                    others_still_running,
+                }) => {
                     log::warn!("giving up on {apps:?}: they will not close");
                     ui.toasts.add_toast(adw::Toast::new(&format!(
                         "{} won't close; giving up on it",
                         apps.join(", ")
                     )));
+                    if others_still_running {
+                        ui.toasts.add_toast(adw::Toast::new(NOT_CLOSED));
+                    }
                 }
                 Err(launch::StopError::Unknown(launched)) => {
                     // The previous app may still be running: start nothing over it.
@@ -1091,6 +1258,7 @@ impl Ui {
                 self.failed(name, &error.into());
             }
         }
+        self.main_row_at_origin();
         if self.window.is_visible() {
             self.window.present();
         }
@@ -1121,42 +1289,59 @@ impl Ui {
         opener.grab_focus();
         true
     }
+}
 
-    /// Hides the pointer after [`POINTER_IDLE`] without movement, and from the start:
-    /// a TV is driven by keyboard or remote until the mouse moves.
-    fn hide_idle_pointer(self: &Rc<Self>, window: &adw::ApplicationWindow) {
-        window.set_cursor_from_name(Some("none"));
-        let last = Cell::new((f64::NAN, f64::NAN));
-        let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+/// Hides the pointer over `widget` after [`POINTER_IDLE`] without movement, and from the
+/// start: a TV is driven by keyboard or remote until the mouse moves. `on_change` is told
+/// whenever the pointer is shown or hidden.
+fn hide_idle_pointer(widget: &impl IsA<gtk::Widget>, on_change: impl Fn(bool) + Clone + 'static) {
+    let widget = widget.clone().upcast::<gtk::Widget>();
+    widget.set_cursor_from_name(Some("none"));
+    let visible = Rc::new(Cell::new(false));
+    let last = Cell::new((f64::NAN, f64::NAN));
+    let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
 
-        let motion = gtk::EventControllerMotion::new();
-        motion.connect_motion({
-            let (ui, window) = (self.clone(), window.clone());
-            move |_, x, y| {
-                // Widgets moving under a still pointer also report motion.
-                let (last_x, last_y) = last.replace((x, y));
-                if (x - last_x).abs() < 1.0 && (y - last_y).abs() < 1.0 {
-                    return;
-                }
-                if !ui.pointer_visible.replace(true) {
-                    window.set_cursor(None);
-                }
-                if let Some(pending) = timer.take() {
-                    pending.remove();
-                }
-                let (ui, window, slot) = (ui.clone(), window.clone(), timer.clone());
-                timer.replace(Some(glib::timeout_add_local_once(
-                    POINTER_IDLE,
-                    move || {
-                        slot.take();
-                        ui.pointer_visible.set(false);
-                        window.set_cursor_from_name(Some("none"));
-                    },
-                )));
+    let motion = gtk::EventControllerMotion::new();
+    motion.connect_motion({
+        // Weak: the controller belongs to the widget, and a strong reference from here
+        // would keep a replaced widget alive.
+        let widget = widget.downgrade();
+        move |_, x, y| {
+            let Some(widget) = widget.upgrade() else {
+                return;
+            };
+            // Widgets moving under a still pointer also report motion.
+            let (last_x, last_y) = last.replace((x, y));
+            if (x - last_x).abs() < 1.0 && (y - last_y).abs() < 1.0 {
+                return;
             }
-        });
-        window.add_controller(motion);
-    }
+            if !visible.replace(true) {
+                on_change(true);
+                widget.set_cursor(None);
+            }
+            if let Some(pending) = timer.take() {
+                pending.remove();
+            }
+            let (widget, on_change, visible, slot) = (
+                widget.downgrade(),
+                on_change.clone(),
+                visible.clone(),
+                timer.clone(),
+            );
+            timer.replace(Some(glib::timeout_add_local_once(
+                POINTER_IDLE,
+                move || {
+                    slot.take();
+                    visible.set(false);
+                    on_change(false);
+                    if let Some(widget) = widget.upgrade() {
+                        widget.set_cursor_from_name(Some("none"));
+                    }
+                },
+            )));
+        }
+    });
+    widget.add_controller(motion);
 }
 
 /// The children of `row`, left to right.
@@ -1179,9 +1364,28 @@ fn place(row: &gtk::Box, button: &gtk::Button, index: usize) {
     row.reorder_child_after(button, index.checked_sub(1).and_then(|i| others.get(i)));
 }
 
+/// Enter, and the select key of a TV remote.
 fn is_enter(key: gtk::gdk::Key) -> bool {
     use gtk::gdk::Key;
-    matches!(key, Key::Return | Key::KP_Enter | Key::ISO_Enter)
+    matches!(key, Key::Return | Key::KP_Enter | Key::ISO_Enter) || is_select(key)
+}
+
+/// `XF86OK`, the keysym of the evdev `KEY_OK`, which a CEC remote's OK button sends.
+/// gdk4 has no constant for it.
+const XF86_OK: u32 = 0x1008_1160;
+
+/// The select or OK button of a remote: evdev `KEY_SELECT` is `XF86Select`
+/// ([`Key::SelectButton`]), `KEY_OK` is `XF86OK`, and `Select` is the old X keysym.
+fn is_select(key: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+    matches!(key, Key::Select | Key::SelectButton)
+        || glib::translate::IntoGlib::into_glib(key) == XF86_OK
+}
+
+/// Escape, Backspace, and the back key of a TV remote.
+fn is_back(key: gtk::gdk::Key) -> bool {
+    use gtk::gdk::Key;
+    matches!(key, Key::Escape | Key::BackSpace | Key::Back)
 }
 
 /// Keys that move the selection from tile to tile.
@@ -1193,12 +1397,25 @@ fn is_navigation(key: gtk::gdk::Key) -> bool {
     )
 }
 
-/// The side of a square tile for a row of `count` tiles in a window `width` wide:
-/// [`TILE_MAX`] if the row fits, else smaller, down to [`TILE_MIN`].
-fn tile_size(width: i32, count: usize) -> i32 {
+/// The side of the square tiles and the gap between them for a row of `count` tiles in
+/// a window `width` wide, such that the row always fits between the page margins.
+/// Tiles are [`TILE_MAX`] with [`TILE_SPACING`] if that fits; else they shrink down to
+/// [`TILE_MIN`]; then the gaps close up, down to [`TILE_MIN_SPACING`]; and only then do
+/// the tiles shrink further.
+fn row_layout(width: i32, count: usize) -> (i32, i32) {
     let count = i32::try_from(count.max(1)).unwrap_or(i32::MAX);
-    let room = width - 2 * PAGE_MARGIN - TILE_SPACING * (count - 1);
-    (room / count).clamp(TILE_MIN, TILE_MAX)
+    let gaps = count - 1;
+    let room = (width - 2 * PAGE_MARGIN).max(count);
+    let size = (room - TILE_SPACING * gaps) / count;
+    if size >= TILE_MIN || gaps == 0 {
+        return (size.clamp(1, TILE_MAX), TILE_SPACING);
+    }
+    let spacing = (room - TILE_MIN * count) / gaps;
+    if spacing >= TILE_MIN_SPACING {
+        return (TILE_MIN, spacing);
+    }
+    let size = (room - TILE_MIN_SPACING * gaps) / count;
+    (size.clamp(1, TILE_MIN), TILE_MIN_SPACING)
 }
 
 fn submenu_page(name: &str) -> String {
@@ -1215,7 +1432,7 @@ struct OwnPage {
 fn builtin_tile(name: &str, icon: &str, description: &str, builtin: Builtin) -> Tile {
     Tile {
         name: name.to_owned(),
-        icon: icon.to_owned(),
+        icon: Some(icon.to_owned()),
         description: Some(description.to_owned()),
         action: Action::Builtin(builtin),
     }
@@ -1336,12 +1553,70 @@ fn power_button() -> gtk::Button {
     button
 }
 
-fn tile_button(tile: &Tile) -> gtk::Button {
-    let icon = if tile.icon_is_file() {
-        gtk::Image::from_gicon(&gio::FileIcon::new(&gio::File::for_path(&tile.icon)))
-    } else {
-        gtk::Image::from_icon_name(&tile.icon)
+/// Shown for a tile whose icon cannot be found.
+const PLACEHOLDER_ICON: &str = "application-x-executable";
+
+/// The image of a tile. A configured icon is used as written; without one, a `desktop`
+/// tile shows its application's icon and a `flatpak` tile the icon named like its
+/// application id. An icon that cannot be found (no desktop file, no icon in it, a name
+/// the icon theme lacks, a file that is not there) shows [`PLACEHOLDER_ICON`] and logs
+/// a warning, so a tile is never blank.
+fn tile_image(tile: &Tile) -> gtk::Image {
+    let theme = gtk::gdk::Display::default().map(|display| gtk::IconTheme::for_display(&display));
+    match find_icon(tile, theme.as_ref()) {
+        Ok(icon) => gtk::Image::from_gicon(&icon),
+        Err(reason) => {
+            log::warn!(
+                "tile \"{}\": {reason}; showing a placeholder icon",
+                tile.name
+            );
+            gtk::Image::from_icon_name(PLACEHOLDER_ICON)
+        }
+    }
+}
+
+fn find_icon(tile: &Tile, theme: Option<&gtk::IconTheme>) -> Result<gio::Icon, String> {
+    let icon: gio::Icon = match (&tile.icon, &tile.action) {
+        (Some(icon), _) if icon.starts_with('/') => {
+            gio::FileIcon::new(&gio::File::for_path(icon)).upcast()
+        }
+        (Some(icon), _) => gio::ThemedIcon::new(icon).upcast(),
+        (None, Action::Desktop(id)) => gio::DesktopAppInfo::new(id)
+            .ok_or_else(|| format!("no desktop file {id}"))?
+            .icon()
+            .ok_or_else(|| format!("{id} names no icon"))?,
+        (None, Action::Flatpak(id)) => gio::ThemedIcon::new(id).upcast(),
+        (None, _) => return Err("no icon".into()),
     };
+    if icon_resolves(&icon, theme) {
+        Ok(icon)
+    } else {
+        Err(format!(
+            "the icon {} cannot be found",
+            gio::prelude::IconExt::to_string(&icon).unwrap_or_default()
+        ))
+    }
+}
+
+/// Whether `icon` is in the icon theme, or is a regular file. Any other kind of icon
+/// is taken as it comes.
+fn icon_resolves(icon: &gio::Icon, theme: Option<&gtk::IconTheme>) -> bool {
+    if let Some(themed) = icon.downcast_ref::<gio::ThemedIcon>() {
+        return theme.is_none_or(|theme| themed.names().iter().any(|name| theme.has_icon(name)));
+    }
+    if let Some(file) = icon.downcast_ref::<gio::FileIcon>() {
+        // A directory would show nothing. (A file that is no image still would; the
+        // loaders, not this check, know which files they can decode.)
+        let kind = file
+            .file()
+            .query_file_type(gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE);
+        return kind == gio::FileType::Regular;
+    }
+    true
+}
+
+fn tile_button(tile: &Tile) -> gtk::Button {
+    let icon = tile_image(tile);
     icon.set_pixel_size(ICON_SIZE);
 
     // Small until `fit_tiles` knows the window width: a larger minimum would make the
@@ -1381,8 +1656,8 @@ fn hint(key: &str, action: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirm_page, is_navigation, own_pages, tile_size, CloseQueue, CONFIRM_PREFIX, TILE_MAX,
-        TILE_MIN,
+        confirm_page, is_back, is_enter, is_navigation, own_pages, row_layout, CloseQueue,
+        CONFIRM_PREFIX, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -1398,25 +1673,76 @@ mod tests {
     }
 
     #[test]
+    fn remote_keys_act_like_their_keyboard_counterparts() {
+        for key in [
+            Key::Return,
+            Key::KP_Enter,
+            Key::ISO_Enter,
+            Key::Select,
+            Key::SelectButton,
+            // SAFETY: a key is only a keyval; gdk has no name for this one.
+            unsafe { glib::translate::FromGlib::from_glib(super::XF86_OK) },
+        ] {
+            assert!(is_enter(key));
+            assert!(!is_back(key));
+        }
+        for key in [Key::Escape, Key::BackSpace, Key::Back] {
+            assert!(is_back(key));
+            assert!(!is_enter(key));
+        }
+        assert!(!is_enter(Key::HomePage) && !is_back(Key::HomePage));
+    }
+
+    // The row of any number of tiles fits between the page margins.
+    #[test]
+    fn a_row_of_any_length_fits_the_screen() {
+        for width in [1280, 1366, 1920, 3840] {
+            for count in 1..=30 {
+                let (size, spacing) = row_layout(width, count);
+                let count = count as i32;
+                let row = count * size + (count - 1) * spacing;
+                assert!(row <= width - 2 * 96, "{count} tiles at {width}: {row} px");
+            }
+        }
+    }
+
+    #[test]
     fn tiles_keep_full_size_on_a_wide_screen() {
-        assert_eq!(tile_size(1600, 6), TILE_MAX);
-        assert_eq!(tile_size(1920, 6), TILE_MAX);
-        assert_eq!(tile_size(3840, 6), TILE_MAX);
+        for width in [1600, 1920, 3840] {
+            assert_eq!(row_layout(width, 6), (TILE_MAX, TILE_SPACING), "{width}");
+        }
     }
 
     #[test]
     fn tiles_shrink_so_the_row_fits_a_small_screen() {
         for width in [1280, 1366, 1440] {
-            let size = tile_size(width, 6);
+            let (size, spacing) = row_layout(width, 6);
             assert!(size < TILE_MAX, "{width}: tiles shrink");
-            assert!(6 * size + 5 * 40 + 2 * 96 <= width, "{width}: the row fits");
+            assert_eq!(spacing, TILE_SPACING, "{width}: the gaps are kept");
         }
     }
 
+    // Past the point where tiles of the minimum size fit with the full gaps, the gaps
+    // close up before the tiles shrink further.
     #[test]
-    fn tiles_never_shrink_below_the_minimum_or_divide_by_zero() {
-        assert_eq!(tile_size(400, 6), TILE_MIN);
-        assert_eq!(tile_size(1920, 0), TILE_MAX);
+    fn a_long_row_closes_the_gaps_before_shrinking_the_tiles() {
+        let (size, spacing) = row_layout(1920, 14);
+        assert_eq!(size, TILE_MIN);
+        assert!(
+            (TILE_MIN_SPACING..TILE_SPACING).contains(&spacing),
+            "{spacing}"
+        );
+
+        let (size, spacing) = row_layout(1920, 30);
+        assert!(size < TILE_MIN, "{size}");
+        assert_eq!(spacing, TILE_MIN_SPACING);
+    }
+
+    #[test]
+    fn a_row_layout_never_divides_by_zero_or_vanishes() {
+        assert_eq!(row_layout(1920, 0), (TILE_MAX, TILE_SPACING));
+        assert!(row_layout(100, 6).0 >= 1);
+        assert!(row_layout(0, 1).0 >= 1);
     }
 
     #[test]

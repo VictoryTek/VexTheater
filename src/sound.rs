@@ -1,11 +1,17 @@
 //! The click sounds: a tick as the selection moves between tiles, and a click as a
-//! tile is chosen.
+//! tile is chosen. They follow GNOME's "event sounds" setting.
 
 use gtk::prelude::*;
+
+const SCHEMA: &str = "org.gnome.desktop.sound";
+const KEY: &str = "event-sounds";
 
 pub struct Sounds {
     moved: gtk::MediaFile,
     chosen: gtk::MediaFile,
+    /// Read at each sound, so switching event sounds off or on takes effect at once.
+    /// None where the setting does not exist (a bare dev shell): the sounds play.
+    settings: Option<gio::Settings>,
 }
 
 impl Sounds {
@@ -14,15 +20,27 @@ impl Sounds {
         Sounds {
             moved: load("move.wav"),
             chosen: load("select.wav"),
+            settings: crate::gnome::settings(SCHEMA)
+                .filter(|settings| settings.settings_schema().is_some_and(|s| s.has_key(KEY))),
         }
     }
 
     pub fn moved(&self) {
-        play(&self.moved);
+        if self.enabled() {
+            play(&self.moved);
+        }
     }
 
     pub fn chosen(&self) {
-        play(&self.chosen);
+        if self.enabled() {
+            play(&self.chosen);
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_none_or(|settings| settings.boolean(KEY))
     }
 }
 

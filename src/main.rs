@@ -16,6 +16,16 @@ use adw::prelude::*;
 pub const APP_ID: &str = "io.github.vextheater";
 
 fn main() -> glib::ExitCode {
+    // Before anything of GTK or GIO is set up: this must work with no display, as in
+    // the sandbox of a Nix build.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|flag| flag == "--check-config")
+    {
+        std::process::exit(check_config(&arguments[1..]));
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     gio::resources_register_include!("compiled.gresource")
@@ -52,6 +62,29 @@ fn main() -> glib::ExitCode {
     }
 
     application.run()
+}
+
+/// `--check-config [FILE]`: checks a configuration file, by default the one the
+/// launcher would read. Exits 0, or 1 with the file and the field at fault on stderr.
+fn check_config(files: &[String]) -> i32 {
+    let path = match files {
+        [] => config::Config::default_path(),
+        [file] => file.into(),
+        _ => {
+            eprintln!("usage: vextheater --check-config [FILE]");
+            return 2;
+        }
+    };
+    match config::Config::load(&path) {
+        Ok(_) => {
+            println!("{}: ok", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("vextheater: {error:#}");
+            1
+        }
+    }
 }
 
 fn load_stylesheet() {

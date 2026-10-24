@@ -48,8 +48,33 @@ one action: `command`, `desktop`, `flatpak`, `submenu` or `builtin`
 (`desktop-mode`, `shutdown`, `restart`). A `submenu` names an entry in the optional
 `"submenus"` object, which maps a name to a list of tiles like `tiles`.
 
-Tiles shrink from 200 px to fit the row on a narrow screen, so a row of any length stays
-on screen.
+The `icon` may be left out of a `desktop` tile, which then shows its application's icon,
+and of a `flatpak` tile, which shows the icon named like its application id. An icon
+that cannot be found (no such desktop file, no icon in it, a name the icon theme lacks,
+a file that is not there) shows a generic placeholder instead, and the launcher logs a
+warning, so a tile is never blank.
+
+The schema is strict: an unknown key anywhere (at the top, in a tile, in a submenu's
+tiles), a tile with no action or with more than one, or a tile that needs an icon and
+has none, is an error, and the launcher shows the configuration error screen. This is
+the contract with vexos-nix: **a new configuration key has to land in VexTheater before
+vexos-nix starts sending it**, because strict parsing, and the check the NixOS module
+runs while building (see `--check-config` below), would otherwise reject it.
+
+A configuration with no tiles shows "No tiles configured" and the power button.
+
+Tiles shrink from 200 px to fit the row on a narrow screen. A long row then closes up
+the gaps between tiles before shrinking the tiles below 100 px (past about 15 tiles on a
+1920 px screen), so a row of any length stays on screen.
+
+`vextheater --check-config [FILE]` checks a configuration file (by default the one the
+launcher would read) without a display. It exits 0 for a good file, or 1 after printing
+the file and the field at fault, e.g. `tiles[2].icon: missing (tile "Files")` (2 for a
+bad argument). The NixOS module runs
+it on `settings` while building, so a bad configuration fails `nixos-rebuild` instead
+of showing the launcher's error screen. When the build machine cannot run the target's
+binaries (cross-compiling), the check is skipped. On the error screen, Retry reads the file
+again; so do `vextheater` and `vextheater --home`.
 
 ### Power menu
 
@@ -60,6 +85,9 @@ Order, Restart and Shutdown. Esc leaves the menu. Restart, Shutdown and Reset Ti
 ask for confirmation first, with Cancel selected, so a stray key press cannot power the
 machine off. Tiles with a `shutdown` or `restart` builtin in a submenu of the
 configuration ask the same way.
+
+A TV remote's keys work too, when its receiver reports them as such: Back like Esc,
+Select or OK like Enter, and Home returns to the tile row.
 
 ### Arranging tiles
 
@@ -97,7 +125,9 @@ launcher uses a plain dark gradient.
   tile, opening the power menu or going back plays a click, like a streaming box. The
   sounds are bundled (`data/sounds/`, written by `scripts/make-sounds.py`) and play
   through GStreamer to the default audio output; with no audio output the launcher stays
-  silent and logs a warning.
+  silent and logs a warning. They follow GNOME's Sound setting "Event sounds"
+  (`org.gnome.desktop.sound event-sounds`): turn it off and the launcher is silent, at
+  once, without a restart.
 - An ordinary tile app runs in its own systemd user scope; a Flatpak app is started
   directly, because Flatpak moves it into a scope of its own, and the launcher records
   that one instance (its process id and start time) in
@@ -111,7 +141,12 @@ launcher uses a plain dark gradient.
   `vextheater --home` closes the app and shows the launcher again (bind it to a key in
   GNOME's keyboard shortcuts, or to a remote's Home button). Both close every
   `vextheater-app-*` scope and recorded Flatpak instance, including apps left running
-  by a launcher that crashed.
+  by a launcher that crashed. When the launcher comes back, whether by home or because
+  the app exited, it selects the tile that opened that app (for a tile in a submenu, the
+  main-row tile that opens the submenu); this is not saved across restarts.
+  - `vextheater --desktop` hides the launcher like Desktop Mode, and `vextheater
+    --toggle` shows it when it is hidden and hides it when it is shown, so one key can
+    switch between theater and desktop mode.
   - No process gets two SIGTERMs: Chromium-based apps like Brave start a clean
     shutdown on the first and die on a second. An ordinary app is stopped through its
     scope; the app started last is signalled directly only if its scope has not
@@ -212,6 +247,15 @@ These depend on the real desktop, so they can only be checked on the machine:
 - **Home from desktop mode.** In desktop mode, run `vextheater --home` from a GNOME
   keyboard shortcut. GNOME 50 must bring the launcher to the front; if it only shows
   a "VexTheater is ready" notification, the launcher cannot raise itself from there.
+- **What the remote sends.** Run `wev` and press the remote's Back, Select (OK) and
+  Home buttons. The launcher takes `XF86Back` as Esc, `XF86Select`, `XF86OK` and the
+  old `Select` as Enter, and `XF86HomePage` as "back to the tile row", on top of the
+  keyboard keys; if the remote reports other key names, they need adding.
+- **GNOME leaves Home to the launcher.** If `wev` shows no event for the remote's Home
+  button, GNOME grabbed it first, and the button never reaches the launcher. Look for
+  the binding with
+  `gsettings list-recursively org.gnome.settings-daemon.plugins.media-keys | grep -i homepage`
+  (no output on the development machine, where Home was not grabbed).
 - **GNOME settings reachable.** `systemctl --user show-environment | grep XDG_DATA_DIRS`
   must not be empty (see Troubleshooting above).
 - **Flatpak keeps one process id.** The launcher closes a Flatpak app through the
@@ -237,5 +281,6 @@ bash scripts/preflight.sh       # fmt, clippy, tests, desktop/AppStream validati
 ```
 
 The start and close lifecycle is covered end to end by `launch::lifecycle_tests`: real
-processes, stub `flatpak` and `systemctl` programs and millisecond timings, so it runs
-without Flatpak or systemd. The device checks above still need the real machine.
+processes, stub `flatpak`, `systemctl` and `systemd-run` programs and millisecond
+timings, so it runs without Flatpak or systemd. Starting an app and then closing it go
+through the same stubs. The device checks above still need the real machine.

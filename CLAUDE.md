@@ -34,6 +34,7 @@ Fast verify (also run by the Stop hook): `export CARGO_TARGET_DIR=$HOME/.cache/v
 - Run: `VEXTHEATER_CONFIG=<file.json> nix develop path:. -c cargo run`
 - A config schema change or a change to the `programs.vextheater` NixOS module interface is Tier 3.
 - UI changes: verify visually, e.g. `nix shell nixpkgs#cage nixpkgs#grim` and screenshot the window at 1920x1080 and at 3840x2160 with scale 2.
+- For cage/grim screenshot runs, use `XDG_RUNTIME_DIR=$HOME/.cache/vextheater/rt` (the scratchpad path is too long for the Wayland socket), with `GSETTINGS_BACKEND=memory` and a private D-Bus session (`dbus-run-session`).
 
 ## Forbidden commands
 

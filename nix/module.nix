@@ -9,6 +9,21 @@ self:
 let
   cfg = config.programs.vextheater;
   json = pkgs.formats.json { };
+
+  settingsFile = json.generate "vextheater-config.json" cfg.settings;
+
+  # A bad `settings` fails the build with the file and field at fault, instead of the
+  # launcher showing an error screen on the TV after the switch. The check runs the
+  # package's own binary, so it is skipped when the build machine cannot execute the
+  # target's binaries (cross-compiling); the settings then go through unchecked, as
+  # before.
+  checkedSettings =
+    if pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform
+    then pkgs.runCommand "vextheater-config-checked.json" { } ''
+      ${lib.getExe cfg.package} --check-config ${settingsFile}
+      cp ${settingsFile} $out
+    ''
+    else settingsFile;
 in
 {
   options.programs.vextheater = {
@@ -36,14 +51,18 @@ in
           ];
         }
       '';
-      description = "Launcher configuration, written to /etc/vextheater/config.json.";
+      description = ''
+        Launcher configuration, written to /etc/vextheater/config.json. Its keys are
+        checked strictly while building: an unknown key fails the build. See the
+        README for the schema.
+      '';
     };
   };
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [ cfg.package ];
 
-    environment.etc."vextheater/config.json".source = json.generate "vextheater-config.json" cfg.settings;
+    environment.etc."vextheater/config.json".source = checkedSettings;
 
     # The session's graphical-session.target pattern (systemd.special(7)). Apps
     # started from tiles move into scopes of their own, so a restart of this service
