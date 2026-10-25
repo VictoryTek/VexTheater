@@ -106,8 +106,14 @@ tile. A picked-up tile is lifted and ringed, ← → move it one place (it stops
 Enter drops it, and Back cancels and puts it back. Back leaves Arrange Tiles. After a
 drop, the selection stays on the tile.
 
+In Arrange Tiles, with nothing picked up, Down on a tile that opens a submenu goes into it,
+still arranging, so its row can be arranged with only the arrow keys, Enter and Back; Back
+comes out to the main row, where a second Back leaves Arrange Tiles. Opening the power
+menu (the button, or Up then Enter) leaves Arrange Tiles, and puts a picked-up tile back.
+
 A remote cannot hold a key: the HDMI-CEC bridge in vexos-nix presses and releases at once,
-and sends no Menu or F2. Use Arrange Tiles from the power menu there (main row only).
+and sends no Menu or F2. Use Arrange Tiles from the power menu there, and Down into a
+submenu to arrange it.
 
 The order is saved per page in `$XDG_STATE_HOME/vextheater/order.json`
 (`~/.local/state/vextheater/`), on top of the configuration: a tile added to the
@@ -116,12 +122,19 @@ are identified by name; tiles on one page that share a name are told apart by th
 among them in the configuration (the first "Browser", the second "Browser"), so each
 keeps its own position. Adding or removing an earlier tile of the same name in the
 configuration shifts the later ones. Reset Tile Order deletes the file and returns every
-row to the configured order.
+row to the configured order; if the file cannot be deleted, it says so and changes
+nothing, since the order would come back at the next start. `vextheater --print-order`
+prints the tiles of each page in the order the launcher shows them (the saved
+arrangement over the configured order, without a display), to see what the file does or
+that a configuration change moved a tile.
 
 **Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
 vexos-nix HTPC module sent them). The button replaces them, so the launcher leaves out of
 the main row any tile with a `desktop-mode`, `shutdown` or `restart` builtin, and any tile
 opening a submenu of only those. Such tiles in a submenu mixed with other tiles stay.
+Submenus that no remaining tile leads to, directly or through another submenu, are left
+out as well, since nothing could open them. This is done when the configuration is read,
+so `--check-config` sees what the launcher uses.
 
 All top-level keys are optional. `title` is shown under the greeting, `homeKey` names
 the key that closes the open app in the key hints, and without `background` the
@@ -295,9 +308,20 @@ and `gsettings reset` puts the Super key back to GNOME's default.)
 
 ### Troubleshooting
 
+`vextheater --diagnose` asks the running launcher to check what it needs from its
+session and prints one `ok` or `FAIL` line per check, exiting 1 if any failed. It runs
+in the launcher's own environment, which for the autostart service is not a shell's:
+GNOME's settings schemas (and `XDG_DATA_DIRS`, where GLib looks for them),
+`systemd-run --user` and `systemctl --user`, `flatpak` on the `PATH` when a tile starts
+a Flatpak app, and the background and icon files named in the configuration. The
+launcher stays busy for the moments this takes, up to 5 s per helper command. When
+theater mode finds its GNOME schemas missing, the launcher also logs one warning
+pointing here.
+
 - The hot corner, Super key or banners never turn off: the launcher finds GNOME's settings
   schemas through `XDG_DATA_DIRS`, and if `systemctl --user show-environment` shows it
-  empty, the launcher quietly can't change GNOME settings.
+  empty, the launcher quietly can't change GNOME settings. `vextheater --diagnose` shows
+  which schemas it cannot find.
 
 ## Verify on the device
 
@@ -346,6 +370,10 @@ These depend on the real desktop, so they can only be checked on the machine:
 nix develop -c cargo run        # VEXTHEATER_CONFIG=./example.json to try a layout
 bash scripts/preflight.sh       # fmt, clippy, tests, desktop/AppStream validation, nix build
 ```
+
+The Rust toolchain is the one in the flake (nixpkgs' `rustc`, `clippy` and `rustfmt`),
+which is the authority: there is no `rust-toolchain.toml`. Outside Nix any Rust from
+1.92 on works (the gtk-rs crates need it).
 
 The start and close lifecycle is covered end to end by `launch::lifecycle_tests`: real
 processes, stub `flatpak`, `systemctl` and `systemd-run` programs and millisecond

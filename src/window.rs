@@ -4,6 +4,7 @@
 
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
+use crate::diagnose;
 use crate::keybinding;
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
@@ -32,7 +33,9 @@ const LONG_PRESS: Duration = Duration::from_millis(600);
 /// Shown when the previous app was still running at the time limit.
 const NOT_CLOSED: &str = "Couldn't close the previous app";
 const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
-const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  Back  done";
+const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  ↓  open a submenu  ·  Back  done";
+/// In a submenu, Back goes back to the main row, where arranging goes on.
+const ARRANGING_IN_SUBMENU_HINT: &str = "Enter  pick up a tile  ·  Back  main row";
 
 /// What choosing a tile does. A configured tile does what its action says; the rest are
 /// the launcher's own, which a configuration cannot ask for.
@@ -209,6 +212,15 @@ pub fn command_line(
             }
             glib::ExitCode::SUCCESS
         }
+        // Reports on the environment of this, the running instance, which is where a
+        // service differs from a shell.
+        [flag] if flag == "--diagnose" => {
+            let ui = ui(application);
+            let config = ui.as_ref().map(|ui| ui.config.borrow());
+            let (report, all_ok) = diagnose::run(config.as_deref());
+            command_line.print_literal(&report);
+            glib::ExitCode::from(u8::from(!all_ok))
+        }
         [flag] if flag == "--reload" => {
             if let Some(ui) = ui(application) {
                 ui.reload(true);
@@ -229,17 +241,43 @@ pub fn command_line(
         }
         _ => {
             command_line.printerr_literal(
-                "usage: vextheater [--home | --desktop | --toggle | --reload | --resume | --check-config [FILE]]\n  \
+                "usage: vextheater [--home | --desktop | --toggle | --reload | --diagnose | --resume | --check-config [FILE] | --print-order]\n  \
                  --home    close the open app and show the launcher\n  \
                  --desktop hide the launcher and show the GNOME desktop\n  \
                  --toggle  show the launcher if it is hidden, else hide it\n  \
                  --reload  read the configuration again and rebuild the tiles\n  \
+                 --diagnose  check what the launcher needs from its session\n  \
                  --resume  show the launcher, unless it crashed in desktop mode\n  \
-                 --check-config [FILE]  check a configuration file and exit (first argument)\n",
+                 --check-config [FILE]  check a configuration file and exit (first argument)\n  \
+                 --print-order  print the tiles in the order shown and exit (first argument)\n",
             );
             glib::ExitCode::from(2)
         }
     }
+}
+
+/// The tiles of the main row and of each submenu, in the order the launcher shows them:
+/// the arrangement in `saved` over the configured order. One page per heading, one tile
+/// per line.
+pub fn order_listing(config: &Config, saved: &crate::order::Saved) -> String {
+    let mut listing = String::new();
+    let main = (Page::Main, "main".to_owned(), &config.tiles);
+    let submenus = config.submenus.iter().map(|(name, tiles)| {
+        (
+            Page::Submenu(name.clone()),
+            format!("submenu {name}"),
+            tiles,
+        )
+    });
+    for (page, heading, tiles) in std::iter::once(main).chain(submenus) {
+        let names: Vec<&str> = tiles.iter().map(|tile| tile.name.as_str()).collect();
+        let shown = crate::order::arrange(&names, saved.get(&page.key()));
+        listing.push_str(&format!("{heading}:\n"));
+        for (position, index) in shown.into_iter().enumerate() {
+            listing.push_str(&format!("  {}. {}\n", position + 1, names[index]));
+        }
+    }
+    listing
 }
 
 /// Shows the launcher (theater mode), e.g. from "Theater Mode" in the app grid.
@@ -596,13 +634,18 @@ impl Ui {
             let ui = ui.clone();
             move |button| {
                 ui.sounds.chosen();
+                // Arranging belongs to the rows: leaving for the power menu ends it, and
+                // puts a tile that is picked up back, so it does not come back with it.
+                ui.stop_arranging();
                 ui.open(Page::Power, button);
             }
         });
         // The power button belongs to the main row only.
         ui.stack.connect_visible_child_name_notify({
-            let power_button = power_button.clone();
+            let (ui, power_button) = (ui.clone(), power_button.clone());
             move |stack| {
+                // The hint says what Back does, which depends on the page.
+                ui.update_arrange_hint();
                 power_button.set_visible(
                     stack
                         .visible_child_name()
@@ -827,6 +870,7 @@ impl Ui {
     /// Theater mode: the launcher full screen over the desktop.
     fn show(self: &Rc<Self>) {
         mode::enter_theater();
+        self.clock.refresh();
         self.reload(false);
         self.refresh_installed();
         self.window.fullscreen();
@@ -1056,12 +1100,38 @@ impl Ui {
                 }
                 None => false,
             },
+            // While arranging, Down on a tile that opens a submenu goes into it, to arrange
+            // that row too; Back comes out again, still arranging.
+            Key::Down if self.arranging.get() => match self.focused_submenu() {
+                Some((name, button)) => {
+                    self.sounds.chosen();
+                    self.open(Page::Submenu(name), &button);
+                    true
+                }
+                None => false,
+            },
             key if is_back(key) && self.arranging.get() && self.on_main_page() => {
                 self.stop_arranging();
                 self.sounds.chosen();
                 true
             }
             _ => false,
+        }
+    }
+
+    /// The submenu the focused tile opens, with that tile, if it opens one.
+    fn focused_submenu(&self) -> Option<(String, gtk::Button)> {
+        let (page, button) = self.focused_tile()?;
+        let index = self
+            .arrangeable
+            .borrow()
+            .get(&page)?
+            .buttons
+            .iter()
+            .position(|candidate| *candidate == button)?;
+        match self.tile(&page, index).command {
+            Command::Config(Action::Submenu(name)) => Some((name, button)),
+            _ => None,
         }
     }
 
@@ -1261,7 +1331,13 @@ impl Ui {
 
     /// Puts every row back in the configured order and forgets the saved one.
     fn reset_order(&self) {
-        order::clear();
+        // If the saved order cannot be removed it would come back at the next start, so
+        // nothing is reset and the user is told, not shown a success.
+        if let Err(error) = order::clear() {
+            log::warn!("cannot reset the tile order: {error}");
+            self.notify(&format!("Couldn't reset the tile order: {error}"));
+            return;
+        }
         self.saved_order.borrow_mut().clear();
         let pages: Vec<Page> = self.arrangeable.borrow().keys().cloned().collect();
         for page in &pages {
@@ -1280,7 +1356,11 @@ impl Ui {
         let text = if self.picked.borrow().is_some() {
             Some(PICKED_HINT)
         } else if self.arranging.get() {
-            Some(ARRANGING_HINT)
+            Some(if self.on_main_page() {
+                ARRANGING_HINT
+            } else {
+                ARRANGING_IN_SUBMENU_HINT
+            })
         } else {
             None
         };
@@ -1986,8 +2066,8 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_back, is_enter, is_navigation, own_pages, row_layout, CloseQueue, Command, Confirmable,
-        Page, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
+        is_back, is_enter, is_navigation, order_listing, own_pages, row_layout, CloseQueue,
+        Command, Confirmable, Page, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -2151,6 +2231,36 @@ mod tests {
         ] {
             assert_eq!(Confirmable::of(&command).is_some(), needs, "{command:?}");
         }
+    }
+
+    // What `--print-order` prints is what the rows show: the saved arrangement, by the keys
+    // the saved file holds, over the configured order; tiles added since go last.
+    #[test]
+    fn the_listing_follows_the_saved_order_of_each_page() {
+        let config = crate::config::Config::parse(
+            r#"{ "tiles": [
+                    { "name": "A", "icon": "a", "command": "a" },
+                    { "name": "B", "icon": "b", "command": "b" },
+                    { "name": "Games", "icon": "g", "submenu": "Games" },
+                    { "name": "New", "icon": "n", "command": "n" } ],
+                "submenus": { "Games": [
+                    { "name": "X", "icon": "x", "command": "x" },
+                    { "name": "Y", "icon": "y", "command": "y" } ] } }"#,
+        )
+        .unwrap();
+        let saved: crate::order::Saved = serde_json::from_str(
+            r#"{"main":[["B",0],["A",0],["Games",0]],"submenu:Games":[["Y",0],["X",0]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            order_listing(&config, &saved),
+            "main:\n  1. B\n  2. A\n  3. Games\n  4. New\nsubmenu Games:\n  1. Y\n  2. X\n"
+        );
+        // With nothing saved, the configured order.
+        assert_eq!(
+            order_listing(&config, &crate::order::Saved::new()),
+            "main:\n  1. A\n  2. B\n  3. Games\n  4. New\nsubmenu Games:\n  1. X\n  2. Y\n"
+        );
     }
 
     // The launcher adds exactly one page for the power menu and for each confirmation,

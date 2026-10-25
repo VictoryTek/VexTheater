@@ -22,6 +22,8 @@ const ENTRY_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys.custom-
 /// The path the shortcut has always had in the vexos-nix module, so the two agree.
 const ENTRY_PATH: &str =
     "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/vextheater-home/";
+/// The schemas the shortcut needs, for [`crate::diagnose`].
+pub const SCHEMAS: [&str; 2] = [LIST_SCHEMA, ENTRY_SCHEMA];
 const NAME: &str = "VexTheater home";
 /// Where NixOS puts the program of the running system. It does not change with a
 /// rebuild, and a garbage collection does not remove it, unlike a store path.

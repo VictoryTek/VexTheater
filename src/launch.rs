@@ -679,34 +679,18 @@ fn children(pid: u32) -> Vec<u32> {
 }
 
 fn flatpaks_file() -> PathBuf {
-    glib::user_runtime_dir()
-        .join("vextheater")
-        .join("flatpak-apps.json")
+    crate::files::runtime_file("flatpak-apps.json")
 }
 
 /// The recorded Flatpak apps. A missing file is the normal empty state; one that cannot
 /// be read or parsed is logged, since the next save overwrites it and the apps it named
 /// could then never be closed.
 fn load_flatpaks(file: &Path) -> Vec<FlatpakApp> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            log::warn!("cannot read the running Flatpak apps: {error}");
-            return Vec::new();
-        }
-    };
-    serde_json::from_str(&text).unwrap_or_else(|error| {
-        log::warn!("ignoring the recorded Flatpak apps: {error}");
-        Vec::new()
-    })
+    crate::files::read_json(file, "the recorded Flatpak apps").unwrap_or_default()
 }
 
 fn save_flatpaks(file: &Path, apps: &[FlatpakApp]) {
-    let written = serde_json::to_vec(apps)
-        .map_err(std::io::Error::other)
-        .and_then(|json| crate::files::write_atomic(file, &json));
-    if let Err(error) = written {
+    if let Err(error) = crate::files::write_json(file, apps) {
         log::error!("cannot record the running Flatpak apps: {error}");
     }
 }

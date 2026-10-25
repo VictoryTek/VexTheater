@@ -147,30 +147,30 @@ same user's `$VEXTHEATER_CONFIG`).
 ## Tier 4: Low priority
 
 ### Batch 4.1: Small isolated fixes (Tier 2, S each)
-- [ ] **CLK-7**: schedule the next clock update at the next minute boundary with `timeout_add_local_once`, instead of the free-running 5 s timer (`clock.rs`).
-- [ ] **A11**: delete `rust-toolchain.toml`, or pin it to nixpkgs' rustc 1.95.0 with clippy and rustfmt and note that the flake is the authority.
+- [x] **CLK-7**: schedule the next clock update at the next minute boundary with `timeout_add_local_once`, instead of the free-running 5 s timer (`clock.rs`).
+- [x] **A11**: delete `rust-toolchain.toml`, or pin it to nixpkgs' rustc 1.95.0 with clippy and rustfmt and note that the flake is the authority.
   → verify: `cargo test`; preflight.
 
 ### Batch 4.2: State-file helpers (Tier 2, S)
-- [ ] **A7**: add `state_file`/`runtime_file`, `write_json` and a `read_json` that logs, all in `files.rs`, and move `mode`, `order`, `gnome` and `launch` over to them. The logging that Batch 1.1 adds moves into `read_json`.
-- [ ] **ORD-6**: `order::clear()` ignores only `NotFound` and logs or returns any other error, and `reset_order` shows a failure toast instead of "Tile order reset".
+- [x] **A7**: add `state_file`/`runtime_file`, `write_json` and a `read_json` that logs, all in `files.rs`, and move `mode`, `order`, `gnome` and `launch` over to them. The logging that Batch 1.1 adds moves into `read_json`.
+- [x] **ORD-6**: `order::clear()` ignores only `NotFound` and logs or returns any other error, and `reset_order` shows a failure toast instead of "Tile order reset".
   → verify: unit tests for each helper; a test where `clear` fails on a read-only directory.
 
 ### Batch 4.3: Config migration cleanup (Tier 2, S)
-- [ ] **A8**: have `drop_power_tiles` also remove submenus that no remaining tile opens (or have `Ui::build` build only reachable ones), and run the migration inside `parse`, so `parse` and `load` return the same thing. The JSON contract does not change.
+- [x] **A8**: have `drop_power_tiles` also remove submenus that no remaining tile opens (or have `Ui::build` build only reachable ones), and run the migration inside `parse`, so `parse` and `load` return the same thing. The JSON contract does not change.
   → verify: the existing migration tests (`config.rs:232-256`) without the manual `drop_power_tiles()` call, plus an old-style config whose "Power" submenu is no longer built.
 
 ### Batch 4.4: `--print-order` (Tier 2, S)
-- [ ] **FEAT-15**: print each page's tile names in the order shown on screen (`order::arrange` over the configured names). It needs only `Config::load_default` and `order::load`.
+- [x] **FEAT-15**: print each page's tile names in the order shown on screen (`order::arrange` over the configured names). It needs only `Config::load_default` and `order::load`.
   → verify: unit test of the output; run it against a saved `order.json`.
 
 ### Batch 4.5: Arranging across pages (Tier 2, S then M)
-- [ ] **UI-3**: in the power button's click handler (`window.rs:335-341`), call `ui.stop_arranging()` (or return while `picked` is `Some`) before `ui.open(POWER_PAGE, …)`. This also fixes the mild form: ↑ then Enter while arranging no longer reaches the power menu with `arranging` still set.
-- [ ] **FEAT-14**: while arranging with nothing picked up, Down on a tile that opens a submenu opens it, still arranging, and Back returns to the main row. Update `ARRANGING_HINT` and the README. Building this on top of UI-3 makes it settle how arranging state behaves across pages.
+- [x] **UI-3**: in the power button's click handler (`window.rs:335-341`), call `ui.stop_arranging()` (or return while `picked` is `Some`) before `ui.open(POWER_PAGE, …)`. This also fixes the mild form: ↑ then Enter while arranging no longer reaches the power menu with `arranging` still set.
+- [x] **FEAT-14**: while arranging with nothing picked up, Down on a tile that opens a submenu opens it, still arranging, and Back returns to the main row. Update `ARRANGING_HINT` and the README. Building this on top of UI-3 makes it settle how arranging state behaves across pages.
   → verify: with the pointer shown and a tile picked up, click power and check that the menu works and the hint is gone; arrange a submenu with only arrows, Enter and Back; screenshots.
 
 ### Batch 4.6: `--diagnose` (Tier 2, M)
-- [ ] **FEAT-13**: have the primary instance report pass/fail for the GNOME schemas and `XDG_DATA_DIRS`, `systemd-run --user`, `systemctl --user list-units`, `flatpak` on `PATH` (if any tile uses it), and whether the background and icon files exist. Also log one `warn!` from `gnome::theater_mode` when a schema is missing.
+- [x] **FEAT-13**: have the primary instance report pass/fail for the GNOME schemas and `XDG_DATA_DIRS`, `systemd-run --user`, `systemctl --user list-units`, `flatpak` on `PATH` (if any tile uses it), and whether the background and icon files exist. Also log one `warn!` from `gnome::theater_mode` when a schema is missing.
   → verify: run it on the device, and once with `XDG_DATA_DIRS` cleared.
 
 ### Batch 4.7: Gamepad navigation (Tier 3, L): decide before building

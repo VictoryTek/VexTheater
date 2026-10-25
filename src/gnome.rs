@@ -7,10 +7,12 @@
 //! launcher restarted after a crash keeps that file rather than reading the values it
 //! had itself turned off.
 
+use crate::files;
 use gio::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The type of a setting the launcher turns off.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -26,6 +28,13 @@ struct Key {
     key: &'static str,
     kind: Kind,
 }
+
+/// The schemas of [`KEYS`], for [`crate::diagnose`].
+pub const SCHEMAS: [&str; 3] = [
+    "org.gnome.desktop.interface",
+    "org.gnome.desktop.notifications",
+    "org.gnome.mutter",
+];
 
 const KEYS: [Key; 3] = [
     Key {
@@ -77,17 +86,35 @@ pub fn theater_mode() {
             return;
         }
     }
+    let mut missing = Vec::new();
     for Key { schema, key, kind } in KEYS {
-        if let Some(settings) = settings(schema) {
-            let off = match kind {
-                Kind::Bool => settings.set_boolean(key, false),
-                Kind::Text => settings.set_string(key, ""),
-            };
-            if let Err(error) = off {
-                log::warn!("cannot turn off {schema} {key}: {error}");
-            }
+        let Some(settings) = settings(schema) else {
+            missing.push(schema);
+            continue;
+        };
+        let off = match kind {
+            Kind::Bool => settings.set_boolean(key, false),
+            Kind::Text => settings.set_string(key, ""),
+        };
+        if let Err(error) = off {
+            log::warn!("cannot turn off {schema} {key}: {error}");
         }
     }
+    if first_to_warn(&WARNED_OF_MISSING, &missing) {
+        log::warn!(
+            "GNOME schemas not found, so their settings are left alone: {}; \
+             see XDG_DATA_DIRS, or run `vextheater --diagnose`",
+            missing.join(", ")
+        );
+    }
+}
+
+static WARNED_OF_MISSING: AtomicBool = AtomicBool::new(false);
+
+/// Whether to warn of `missing` schemas now: when there are some, and not again at
+/// every showing of the launcher.
+fn first_to_warn(warned: &AtomicBool, missing: &[&str]) -> bool {
+    !missing.is_empty() && !warned.swap(true, Ordering::Relaxed)
 }
 
 /// Puts back the values saved by [`theater_mode`]; nothing to do if it never ran.
@@ -139,24 +166,22 @@ fn id(schema: &str, key: &str) -> String {
 }
 
 fn state_file() -> PathBuf {
-    glib::user_state_dir()
-        .join("vextheater")
-        .join("gnome-settings.json")
+    files::state_file("gnome-settings.json")
 }
 
 fn save(path: &Path, values: &Values) -> anyhow::Result<()> {
-    crate::files::write_atomic(path, serde_json::to_string(values)?.as_bytes())?;
+    files::write_json(path, values)?;
     Ok(())
 }
 
 /// Reads and removes the saved values. An unreadable file is removed too, so it
 /// cannot block saving fresh values next time.
 fn take(path: &Path) -> Option<Values> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let _ = std::fs::remove_file(path);
-    serde_json::from_str(&text)
-        .inspect_err(|error| log::warn!("ignoring {}: {error}", path.display()))
-        .ok()
+    let values = files::read_json(path, "the saved GNOME settings");
+    if let Err(error) = files::remove(path) {
+        log::warn!("cannot remove {}: {error}", path.display());
+    }
+    values
 }
 
 #[cfg(test)]
@@ -167,6 +192,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vextheater-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    #[test]
+    fn missing_schemas_are_warned_of_once() {
+        let warned = AtomicBool::new(false);
+        assert!(
+            !first_to_warn(&warned, &[]),
+            "nothing missing, nothing to say"
+        );
+        assert!(first_to_warn(&warned, &["org.gnome.mutter"]));
+        assert!(
+            !first_to_warn(&warned, &["org.gnome.mutter"]),
+            "not at every showing"
+        );
+        assert!(!first_to_warn(&warned, &["org.gnome.desktop.interface"]));
+    }
+
+    // `SCHEMAS` is what the diagnosis checks, so it must name the schema of every key.
+    #[test]
+    fn the_schema_list_covers_every_key() {
+        for key in KEYS {
+            assert!(SCHEMAS.contains(&key.schema), "{}", key.schema);
+        }
+        assert_eq!(SCHEMAS.len(), KEYS.len());
     }
 
     #[test]

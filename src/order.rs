@@ -3,6 +3,7 @@
 //! identities per page. It is applied on top of the configured order, so tiles added to
 //! the configuration later still show up.
 
+use crate::files;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -14,36 +15,25 @@ pub type Identity = (String, usize);
 pub type Saved = BTreeMap<String, Vec<Identity>>;
 
 fn file() -> PathBuf {
-    glib::user_state_dir().join("vextheater").join("order.json")
+    files::state_file("order.json")
 }
 
-/// The saved order, or none if there is none or the file cannot be read.
+/// The saved order, or none if there is none or the file cannot be used.
 pub fn load() -> Saved {
-    match std::fs::read_to_string(file()) {
-        Ok(text) => parse(&text),
-        Err(_) => Saved::new(),
-    }
+    files::read_json(&file(), "the saved tile order").unwrap_or_default()
 }
 
 pub fn save(saved: &Saved) {
-    let result = serde_json::to_vec(saved)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| crate::files::write_atomic(&file(), &bytes));
-    if let Err(error) = result {
+    if let Err(error) = files::write_json(&file(), saved) {
         log::warn!("cannot save the tile order: {error}");
     }
 }
 
-/// Forgets the saved order, so the tiles are back in the configured order.
-pub fn clear() {
-    let _ = std::fs::remove_file(file());
-}
-
-fn parse(text: &str) -> Saved {
-    serde_json::from_str(text).unwrap_or_else(|error| {
-        log::warn!("ignoring the saved tile order: {error}");
-        Saved::new()
-    })
+/// Forgets the saved order, so the tiles are back in the configured order. It is an
+/// error if the file is there and cannot be removed: the order would come back at the
+/// next start.
+pub fn clear() -> std::io::Result<()> {
+    files::remove(&file())
 }
 
 /// The identity of each of a page's tiles, from their names in configured order. Tiles
@@ -180,19 +170,28 @@ mod tests {
         assert_eq!(step(0, 1, 1), None);
     }
 
+    /// The order read from a file holding `text`.
+    fn read(name: &str, text: &str) -> Saved {
+        let dir = std::env::temp_dir().join(format!("vextheater-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        files::read_json(&path, "the test order").unwrap_or_default()
+    }
+
     #[test]
     fn reads_the_order_it_writes() {
         let mut order = Saved::new();
         order.insert("main".into(), saved_with(&[("B", 0), ("A", 1)]));
         let text = serde_json::to_string(&order).unwrap();
-        assert_eq!(parse(&text), order);
+        assert_eq!(read("good.json", &text), order);
     }
 
     #[test]
     fn a_corrupt_file_is_no_saved_order() {
-        assert!(parse("").is_empty());
-        assert!(parse("{ not json").is_empty());
-        assert!(parse(r#"{ "main": "A" }"#).is_empty());
-        assert!(parse(r#"{ "main": ["A"] }"#).is_empty());
+        assert!(read("empty.json", "").is_empty());
+        assert!(read("garbage.json", "{ not json").is_empty());
+        assert!(read("string.json", r#"{ "main": "A" }"#).is_empty());
+        assert!(read("short.json", r#"{ "main": ["A"] }"#).is_empty());
     }
 }

@@ -152,28 +152,54 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let mut config = Self::parse(&text)
-            .with_context(|| format!("invalid configuration in {}", path.display()))?;
-        config.drop_power_tiles();
-        Ok(config)
+        Self::parse(&text).with_context(|| format!("invalid configuration in {}", path.display()))
     }
 
-    /// The power button beside the clock replaces the Desktop Mode, Restart and Shutdown
-    /// tiles, and a tile opening a submenu of only those (the old "Power" tile). A
-    /// configuration that still sends them, as the vexos-nix HTPC module used to, would
-    /// show them twice.
-    fn drop_power_tiles(&mut self) {
-        let submenus = &self.submenus;
-        self.tiles.retain(|tile| !is_power_tile(tile, submenus));
-    }
-
+    /// Reads a configuration, migrated (see [`Config::migrate`]), so what is checked is
+    /// what the launcher uses.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let config: Self = serde_json::from_str(text).map_err(|error| match locate(text) {
+        let mut config: Self = serde_json::from_str(text).map_err(|error| match locate(text) {
             Some(problem) => anyhow::anyhow!(problem),
             None => error.into(),
         })?;
         config.validate()?;
+        config.migrate();
         Ok(config)
+    }
+
+    /// Brings a configuration from before the power button up to date. The button
+    /// replaces the Desktop Mode, Restart and Shutdown tiles, and a tile opening a
+    /// submenu of only those (the old "Power" tile); a configuration that still sends
+    /// them, as the vexos-nix HTPC module used to, would show them twice. The submenus
+    /// that no remaining tile leads to are dropped too, since nothing could open them.
+    fn migrate(&mut self) {
+        let submenus = &self.submenus;
+        self.tiles.retain(|tile| !is_power_tile(tile, submenus));
+        self.drop_unreachable_submenus();
+    }
+
+    /// Keeps the submenus that a tile of the main row leads to, directly or through
+    /// another submenu.
+    fn drop_unreachable_submenus(&mut self) {
+        let opened_by = |tiles: &[Tile]| -> Vec<String> {
+            tiles
+                .iter()
+                .filter_map(|tile| match &tile.action {
+                    Action::Submenu(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut to_visit = opened_by(&self.tiles);
+        while let Some(name) = to_visit.pop() {
+            if reachable.insert(name.clone()) {
+                if let Some(tiles) = self.submenus.get(&name) {
+                    to_visit.extend(opened_by(tiles));
+                }
+            }
+        }
+        self.submenus.retain(|name, _| reachable.contains(name));
     }
 
     /// Every `submenu` action must name a submenu that exists.
@@ -340,13 +366,12 @@ mod tests {
                     { "name": "YouTube", "icon": "/icons/youtube.svg", "description": "Full screen", "command": "brave --kiosk" },
                     { "name": "Files", "icon": "org.gnome.Nautilus", "desktop": "org.gnome.Nautilus.desktop" },
                     { "name": "FreeTube", "icon": "io.freetubeapp.FreeTube", "flatpak": "io.freetubeapp.FreeTube" },
-                    { "name": "Desktop", "icon": "user-desktop", "builtin": "desktop-mode" },
-                    { "name": "Power", "icon": "system-shutdown-symbolic", "submenu": "Power" }
+                    { "name": "System", "icon": "preferences-system", "submenu": "System" }
                 ],
                 "submenus": {
-                    "Power": [
-                        { "name": "Shutdown", "icon": "system-shutdown-symbolic", "builtin": "shutdown" },
-                        { "name": "Restart", "icon": "system-reboot-symbolic", "builtin": "restart" }
+                    "System": [
+                        { "name": "Desktop", "icon": "user-desktop", "builtin": "desktop-mode" },
+                        { "name": "Settings", "icon": "org.gnome.Settings", "desktop": "org.gnome.Settings.desktop" }
                     ]
                 }
             }"#,
@@ -365,13 +390,12 @@ mod tests {
                 &Action::Command("brave --kiosk".into()),
                 &Action::Desktop("org.gnome.Nautilus.desktop".into()),
                 &Action::Flatpak("io.freetubeapp.FreeTube".into()),
-                &Action::Builtin(Builtin::DesktopMode),
-                &Action::Submenu("Power".into()),
+                &Action::Submenu("System".into()),
             ]
         );
         assert_eq!(
-            config.submenus["Power"][1].action,
-            Action::Builtin(Builtin::Restart)
+            config.submenus["System"][0].action,
+            Action::Builtin(Builtin::DesktopMode)
         );
         assert_eq!(config.tiles[0].icon.as_deref(), Some("/icons/youtube.svg"));
         assert_eq!(config.tiles[1].icon.as_deref(), Some("org.gnome.Nautilus"));
@@ -413,7 +437,7 @@ mod tests {
 
     #[test]
     fn the_power_button_replaces_configured_power_tiles() {
-        let mut config = Config::parse(
+        let config = Config::parse(
             r#"{
                 "tiles": [
                     { "name": "Files", "icon": "f", "desktop": "org.gnome.Nautilus.desktop" },
@@ -437,10 +461,61 @@ mod tests {
             }"#,
         )
         .unwrap();
-        config.drop_power_tiles();
 
         let names: Vec<_> = config.tiles.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["Files", "System", "Empty"]);
+        // The "Power" submenu, which only the dropped tile opened, goes with it; the ones
+        // the remaining tiles open stay, an empty one included.
+        let submenus: Vec<_> = config.submenus.keys().map(String::as_str).collect();
+        assert_eq!(submenus, ["Empty", "System"]);
+    }
+
+    #[test]
+    fn a_submenu_that_nothing_opens_is_dropped() {
+        let config = Config::parse(
+            r#"{
+                "tiles": [
+                    { "name": "Games", "icon": "g", "submenu": "Games" }
+                ],
+                "submenus": {
+                    "Games": [
+                        { "name": "More", "icon": "m", "submenu": "More" },
+                        { "name": "Doom", "icon": "d", "command": "doom" }
+                    ],
+                    "More": [ { "name": "Quake", "icon": "q", "command": "quake" } ],
+                    "Unused": [ { "name": "A", "icon": "a", "command": "a" } ],
+                    "Loop A": [ { "name": "To B", "icon": "b", "submenu": "Loop B" } ],
+                    "Loop B": [ { "name": "To A", "icon": "a", "submenu": "Loop A" } ]
+                }
+            }"#,
+        )
+        .unwrap();
+        // One reached through another submenu stays; one nothing opens, and two that only
+        // open each other, go.
+        let submenus: Vec<_> = config.submenus.keys().map(String::as_str).collect();
+        assert_eq!(submenus, ["Games", "More"]);
+    }
+
+    // What `--check-config` checks is what the launcher loads: `load` adds nothing to
+    // `parse`.
+    #[test]
+    fn loading_a_file_gives_what_parsing_its_text_gives() {
+        let text = r#"{
+            "tiles": [
+                { "name": "Desktop", "icon": "d", "builtin": "desktop-mode" },
+                { "name": "Power", "icon": "p", "submenu": "Power" },
+                { "name": "Files", "icon": "f", "command": "files" }
+            ],
+            "submenus": { "Power": [ { "name": "Shutdown", "icon": "s", "builtin": "shutdown" } ] }
+        }"#;
+        let dir = std::env::temp_dir().join(format!("vextheater-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old-style.json");
+        std::fs::write(&path, text).unwrap();
+        let parsed = Config::parse(text).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), parsed);
+        assert_eq!(parsed.tiles.len(), 1);
+        assert!(parsed.submenus.is_empty());
     }
 
     /// The message `parse` gives for `text`, which must be rejected.

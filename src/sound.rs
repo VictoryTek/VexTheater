@@ -3,7 +3,7 @@
 
 use gtk::prelude::*;
 
-const SCHEMA: &str = "org.gnome.desktop.sound";
+pub const SCHEMA: &str = "org.gnome.desktop.sound";
 const KEY: &str = "event-sounds";
 
 pub struct Sounds {

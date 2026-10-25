@@ -2,6 +2,7 @@
 
 mod clock;
 mod config;
+mod diagnose;
 mod files;
 mod gnome;
 mod keybinding;
@@ -26,6 +27,12 @@ fn main() -> glib::ExitCode {
         .is_some_and(|flag| flag == "--check-config")
     {
         std::process::exit(check_config(&arguments[1..]));
+    }
+    if arguments
+        .first()
+        .is_some_and(|flag| flag == "--print-order")
+    {
+        std::process::exit(print_order(&arguments[1..]));
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -79,6 +86,26 @@ fn check_config(files: &[String]) -> i32 {
     match config::Config::load(&path) {
         Ok(_) => {
             println!("{}: ok", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("vextheater: {error:#}");
+            1
+        }
+    }
+}
+
+/// `--print-order`: prints the tiles of each page in the order the launcher shows them,
+/// the saved arrangement over the configured order. Needs no display, and is for seeing
+/// what an `order.json` does, or that a configuration change moved something.
+fn print_order(extra: &[String]) -> i32 {
+    if !extra.is_empty() {
+        eprintln!("usage: vextheater --print-order");
+        return 2;
+    }
+    match config::Config::load_default() {
+        Ok(config) => {
+            print!("{}", window::order_listing(&config, &order::load()));
             0
         }
         Err(error) => {

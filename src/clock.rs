@@ -10,7 +10,7 @@ pub struct Clock {
     time: gtk::Label,
     date: gtk::Label,
     /// Weak, so the greeting of a page that was replaced is not kept alive.
-    greetings: Rc<RefCell<Vec<glib::WeakRef<gtk::Label>>>>,
+    greetings: Greetings,
     time_format: &'static str,
 }
 
@@ -53,21 +53,44 @@ impl Clock {
         greeting
     }
 
-    /// Shows the current time, then refreshes it every few seconds. The clock lives
+    /// Shows the current time, then refreshes it as each minute begins. The clock lives
     /// as long as the window, so the timer is never removed.
     pub fn start(&self) {
-        let (time, date, greetings, format) = (
+        tick(
             self.time.clone(),
             self.date.clone(),
             self.greetings.clone(),
             self.time_format,
         );
-        update(&time, &date, &greetings, format);
-        glib::timeout_add_seconds_local(5, move || {
-            update(&time, &date, &greetings, format);
-            glib::ControlFlow::Continue
-        });
     }
+
+    /// Shows the current time now. The timer counts time the machine is awake, so after
+    /// a suspend it can be up to a minute behind until it next fires.
+    pub fn refresh(&self) {
+        update(&self.time, &self.date, &self.greetings, self.time_format);
+    }
+}
+
+type Greetings = Rc<RefCell<Vec<glib::WeakRef<gtk::Label>>>>;
+
+/// Updates the labels, and again just after the next minute begins, which is when the
+/// time, and at the turn of an hour the greeting, can change.
+fn tick(time: gtk::Label, date: gtk::Label, greetings: Greetings, format: &'static str) {
+    update(&time, &date, &greetings, format);
+    let wait = glib::DateTime::now_local()
+        .map(|now| millis_until_next_minute(now.second(), now.microsecond()))
+        .unwrap_or(5_000);
+    glib::timeout_add_local_once(std::time::Duration::from_millis(wait), move || {
+        tick(time, date, greetings, format);
+    });
+}
+
+/// How long until the next minute begins, at `second` and `microsecond` into this one,
+/// plus a few milliseconds so the update lands after the boundary, not before it.
+fn millis_until_next_minute(second: i32, microsecond: i32) -> u64 {
+    const MARGIN: i64 = 50;
+    let into_minute = i64::from(second) * 1000 + i64::from(microsecond) / 1000;
+    (60_000 - into_minute.clamp(0, 59_999) + MARGIN) as u64
 }
 
 fn update(
@@ -107,4 +130,28 @@ fn greeting_for(now: &glib::DateTime) -> &'static str {
 fn uses_24h_clock() -> bool {
     crate::gnome::settings("org.gnome.desktop.interface")
         .is_some_and(|settings| settings.string("clock-format") == "24h")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::millis_until_next_minute;
+
+    // The update lands just after the minute begins, never before it.
+    #[test]
+    fn the_next_update_is_just_after_the_next_minute_begins() {
+        assert_eq!(millis_until_next_minute(0, 0), 60_050);
+        assert_eq!(millis_until_next_minute(30, 500_000), 29_550);
+        assert_eq!(millis_until_next_minute(59, 999_000), 51);
+        assert_eq!(millis_until_next_minute(59, 0), 1_050);
+    }
+
+    #[test]
+    fn out_of_range_readings_still_give_a_sane_wait() {
+        assert_eq!(millis_until_next_minute(-5, -1), 60_050);
+        assert_eq!(millis_until_next_minute(61, 2_000_000), 51);
+        for second in 0..60 {
+            let wait = millis_until_next_minute(second, 0);
+            assert!((1_000..=61_000).contains(&wait), "{second}: {wait}");
+        }
+    }
 }
