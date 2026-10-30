@@ -88,10 +88,9 @@ again; so do `vextheater` and `vextheater --home`.
 
 The round power button beside the clock is part of the launcher, not of the
 configuration: press Up from the tile row to select it (Down goes back to the tiles) and
-Enter, or click it, to open the power menu with Desktop Mode, Arrange Tiles, Reset Tile
-Order, Restart and Shutdown. Esc leaves the menu. Restart, Shutdown and Reset Tile Order
-ask for confirmation first, with Cancel selected, so a stray key press cannot power the
-machine off. Tiles with a `shutdown` or `restart` builtin in a submenu of the
+Enter, or click it, to open the power menu with Desktop Mode, Restart and Shutdown. Esc
+leaves the menu. Restart, Shutdown and Reset Tile Order (below) ask for confirmation
+first, with Cancel selected, so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in a submenu of the
 configuration ask the same way.
 
 A TV remote's keys work too, when its receiver reports them as such: Back like Esc,
@@ -101,19 +100,16 @@ Select or OK like Enter, and Home returns to the tile row.
 
 The tiles of the main row and of the configured submenus can be reordered from the
 launcher (the power menu cannot). Pick a tile up by holding Enter on it, or pressing Menu
-or F2; or choose Arrange Tiles in the power menu, after which Enter picks up the selected
-tile. A picked-up tile is lifted and ringed, ← → move it one place (it stops at the ends),
-Enter drops it, and Back cancels and puts it back. Back leaves Arrange Tiles. After a
-drop, the selection stays on the tile.
+or F2. A picked-up tile is lifted and ringed, ← → move it one place (it stops at the ends),
+Enter drops it, and Back cancels and puts it back. After a drop, the selection stays on
+the tile.
 
-In Arrange Tiles, with nothing picked up, Down on a tile that opens a submenu goes into it,
-still arranging, so its row can be arranged with only the arrow keys, Enter and Back; Back
-comes out to the main row, where a second Back leaves Arrange Tiles. Opening the power
-menu (the button, or Up then Enter) leaves Arrange Tiles, and puts a picked-up tile back.
+Holding Back for two seconds on the main row asks to reset the tile order to the
+configured one, after confirmation (Cancel is selected first).
 
-A remote cannot hold a key: the HDMI-CEC bridge in vexos-nix presses and releases at once,
-and sends no Menu or F2. Use Arrange Tiles from the power menu there, and Down into a
-submenu to arrange it.
+A remote that cannot hold a key cannot do either: the HDMI-CEC bridge in vexos-nix
+presses and releases at once, and sends no Menu or F2. Use a keyboard, or a USB or
+Bluetooth remote, to arrange or reset.
 
 The order is saved per page in `$XDG_STATE_HOME/vextheater/order.json`
 (`~/.local/state/vextheater/`), on top of the configuration: a tile added to the
@@ -121,7 +117,7 @@ configuration later goes last, and a removed one is dropped from the saved order
 are identified by name; tiles on one page that share a name are told apart by their place
 among them in the configuration (the first "Browser", the second "Browser"), so each
 keeps its own position. Adding or removing an earlier tile of the same name in the
-configuration shifts the later ones. Reset Tile Order deletes the file and returns every
+configuration shifts the later ones. Resetting the order deletes the file and returns every
 row to the configured order; if the file cannot be deleted, it says so and changes
 nothing, since the order would come back at the next start. `vextheater --print-order`
 prints the tiles of each page in the order the launcher shows them (the saved
@@ -158,7 +154,8 @@ launcher uses a plain dark gradient.
   starting the new one, so a second Brave cannot hand its window to one that is
   shutting down. Only one close runs at a time: tiles chosen (or home pressed) during
   a close replace each other, and only the last one is acted on when it finishes.
-  Choosing Desktop Mode cancels a pending tile.
+  Choosing Desktop Mode during a close replaces a pending tile, and the launcher hides
+  once the previous app is gone, so it is not uncovered while closing.
   `vextheater --home` closes the app and shows the launcher again (see "The home key"
   below for the shortcut). Both close every
   `vextheater-app-*` scope and recorded Flatpak instance, including apps left running

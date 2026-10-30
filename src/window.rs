@@ -33,9 +33,8 @@ const LONG_PRESS: Duration = Duration::from_millis(600);
 /// Shown when the previous app was still running at the time limit.
 const NOT_CLOSED: &str = "Couldn't close the previous app";
 const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
-const ARRANGING_HINT: &str = "Enter  pick up a tile  ·  ↓  open a submenu  ·  Back  done";
-/// In a submenu, Back goes back to the main row, where arranging goes on.
-const ARRANGING_IN_SUBMENU_HINT: &str = "Enter  pick up a tile  ·  Back  main row";
+/// Holding Back on the main row this long asks to reset the tile order.
+const RESET_HOLD: Duration = Duration::from_secs(2);
 
 /// What choosing a tile does. A configured tile does what its action says; the rest are
 /// the launcher's own, which a configuration cannot ask for.
@@ -44,10 +43,7 @@ enum Command {
     Config(Action),
     /// Leaves a confirmation page.
     Cancel,
-    /// Lets tiles be picked up and moved. Only the power menu has it.
-    Arrange,
-    /// Puts the tiles back in the configured order. The power menu and its confirmation
-    /// have it.
+    /// Puts the tiles back in the configured order. Its confirmation has it.
     ResetOrder,
 }
 
@@ -56,7 +52,7 @@ impl Command {
     fn is_installed(&self) -> bool {
         match self {
             Command::Config(action) => launch::is_installed(action),
-            Command::Cancel | Command::Arrange | Command::ResetOrder => true,
+            Command::Cancel | Command::ResetOrder => true,
         }
     }
 }
@@ -117,8 +113,7 @@ impl Confirmable {
                 | Action::Flatpak(_)
                 | Action::Submenu(_),
             )
-            | Command::Cancel
-            | Command::Arrange => None,
+            | Command::Cancel => None,
         }
     }
 
@@ -400,6 +395,8 @@ fn show_error(
 enum Request {
     /// Stay on the launcher.
     Home,
+    /// Hide the launcher for desktop mode.
+    Desktop,
     /// Start this tile's app (tile name, action).
     Tile(String, Action),
 }
@@ -435,11 +432,6 @@ impl<T> CloseQueue<T> {
     /// Whether a close is running.
     fn is_busy(&self) -> bool {
         self.closing.get()
-    }
-
-    /// Drops the pending request, e.g. when the launcher hides for desktop mode.
-    fn cancel(&self) {
-        self.pending.replace(None);
     }
 }
 
@@ -507,15 +499,17 @@ struct Ui {
     /// The arranged order, as saved to disk.
     saved_order: RefCell<order::Saved>,
     picked: RefCell<Option<Picked>>,
-    /// Enter picks a tile up instead of opening it, until Back. Set from the power menu,
-    /// for a remote that cannot hold Enter or press Menu.
-    arranging: Cell<bool>,
     /// Enter is held down. Keyboard auto-repeat sends more presses while it is, and
     /// they must not pick a tile up or drop it again.
     enter_down: Cell<bool>,
     /// Counts down a long press of Enter on a tile.
     enter_timer: RefCell<Option<glib::SourceId>>,
-    /// What the keys do while a tile is picked up or arranging.
+    /// Back is held down on the main row; like `enter_down`, so auto-repeat does not
+    /// start the timer again.
+    back_down: Cell<bool>,
+    /// Counts down a long press of Back on the main row.
+    back_timer: RefCell<Option<glib::SourceId>>,
+    /// What the keys do while a tile is picked up.
     arrange_hint: gtk::Label,
 }
 
@@ -618,9 +612,10 @@ impl Ui {
             arrangeable: RefCell::default(),
             saved_order: RefCell::new(order::load()),
             picked: RefCell::default(),
-            arranging: Cell::new(false),
             enter_down: Cell::new(false),
             enter_timer: RefCell::default(),
+            back_down: Cell::new(false),
+            back_timer: RefCell::default(),
             arrange_hint,
         });
 
@@ -734,6 +729,8 @@ impl Ui {
             move |_, key, _, _| {
                 if is_enter(key) {
                     ui.enter_released();
+                } else if is_back(key) {
+                    ui.back_released();
                 }
             }
         });
@@ -885,12 +882,20 @@ impl Ui {
         self.show();
     }
 
-    /// Hides the launcher. A tile or home chosen during a close that is still running
-    /// is cancelled, so no app starts over the desktop once it finishes.
+    /// Hides the launcher. During a close that is still running it waits for the close,
+    /// replacing any pending tile, so the app being closed is not uncovered and no app
+    /// starts over the desktop once the close finishes.
     fn desktop_mode(&self) {
         // Back on the main row when the launcher comes back, not in the power menu.
         self.main_row();
-        self.closes.cancel();
+        if self.closes.is_busy() {
+            self.closes.submit(Request::Desktop);
+            return;
+        }
+        self.hide_for_desktop();
+    }
+
+    fn hide_for_desktop(&self) {
         mode::enter_desktop();
         self.window.set_visible(false);
     }
@@ -1035,7 +1040,7 @@ impl Ui {
             button.connect_clicked({
                 let (ui, page) = (self.clone(), page.clone());
                 move |button| {
-                    if ui.click_while_arranging(&page, button) {
+                    if ui.click_while_picked() {
                         return;
                     }
                     ui.sounds.chosen();
@@ -1100,44 +1105,45 @@ impl Ui {
                 }
                 None => false,
             },
-            // While arranging, Down on a tile that opens a submenu goes into it, to arrange
-            // that row too; Back comes out again, still arranging.
-            Key::Down if self.arranging.get() => match self.focused_submenu() {
-                Some((name, button)) => {
-                    self.sounds.chosen();
-                    self.open(Page::Submenu(name), &button);
-                    true
-                }
-                None => false,
-            },
-            key if is_back(key) && self.arranging.get() && self.on_main_page() => {
-                self.stop_arranging();
-                self.sounds.chosen();
+            // Holding Back on the main row asks to reset the tile order. Back does
+            // nothing else there, so the press is dealt with here.
+            key if is_back(key) && self.on_main_page() => {
+                self.back_pressed();
                 true
             }
             _ => false,
         }
     }
 
-    /// The submenu the focused tile opens, with that tile, if it opens one.
-    fn focused_submenu(&self) -> Option<(String, gtk::Button)> {
-        let (page, button) = self.focused_tile()?;
-        let index = self
-            .arrangeable
-            .borrow()
-            .get(&page)?
-            .buttons
-            .iter()
-            .position(|candidate| *candidate == button)?;
-        match self.tile(&page, index).command {
-            Command::Config(Action::Submenu(name)) => Some((name, button)),
-            _ => None,
+    /// Back on the main row: after [`RESET_HOLD`] the reset confirmation opens, unless
+    /// Back is released first.
+    fn back_pressed(self: &Rc<Self>) {
+        if self.back_down.replace(true) {
+            // Auto-repeat of a press that is already dealt with.
+            return;
+        }
+        let ui = self.clone();
+        self.back_timer
+            .replace(Some(glib::timeout_add_local_once(RESET_HOLD, move || {
+                ui.back_timer.take();
+                let opener = GtkWindowExt::focus(&ui.window)
+                    .and_then(|focus| focus.downcast::<gtk::Button>().ok())
+                    .unwrap_or_else(|| ui.power_button.clone());
+                ui.sounds.chosen();
+                ui.open(Page::Confirm(Confirmable::ResetOrder), &opener);
+            })));
+    }
+
+    fn back_released(&self) {
+        self.back_down.set(false);
+        if let Some(timer) = self.back_timer.take() {
+            timer.remove();
         }
     }
 
-    /// Enter on a tile of a rearrangeable row: while arranging it picks the tile up at
-    /// once; otherwise the tile opens when Enter is released, unless it is held for
-    /// [`LONG_PRESS`], which picks the tile up. With a tile picked up, Enter drops it.
+    /// Enter on a tile of a rearrangeable row: the tile opens when Enter is released,
+    /// unless it is held for [`LONG_PRESS`], which picks the tile up. With a tile picked
+    /// up, Enter drops it.
     /// True if the press is dealt with here, false to leave it to GTK.
     fn enter_pressed(self: &Rc<Self>) -> bool {
         let picked = self.picked.borrow().is_some();
@@ -1151,7 +1157,6 @@ impl Ui {
         }
         match tile {
             None => self.drop_picked(),
-            Some((page, button)) if self.arranging.get() => self.pick_up(&page, &button),
             Some((page, button)) => {
                 let ui = self.clone();
                 self.enter_timer.replace(Some(glib::timeout_add_local_once(
@@ -1180,15 +1185,11 @@ impl Ui {
         }
     }
 
-    /// A click on a tile while one is picked up drops it, and while arranging picks the
-    /// tile up. True if the click was used for that, so it does not open the tile.
-    fn click_while_arranging(&self, page: &Page, button: &gtk::Button) -> bool {
+    /// A click on a tile while one is picked up drops it. True if the click was used for
+    /// that, so it does not open the tile.
+    fn click_while_picked(&self) -> bool {
         if self.picked.borrow().is_some() {
             self.drop_picked();
-            return true;
-        }
-        if self.arranging.get() && self.arrangeable.borrow().contains_key(page) {
-            self.pick_up(page, button);
             return true;
         }
         false
@@ -1269,13 +1270,16 @@ impl Ui {
         self.update_arrange_hint();
     }
 
-    /// Ends everything the arranging keys started: a tile picked up goes back, the
-    /// arranging mode and a pending long press end.
+    /// Ends everything the arranging keys started: a tile picked up goes back, and a
+    /// pending long press of Enter or Back ends.
     fn stop_arranging(&self) {
         self.cancel_picked();
-        self.arranging.set(false);
         self.enter_down.set(false);
         if let Some(timer) = self.enter_timer.take() {
+            timer.remove();
+        }
+        self.back_down.set(false);
+        if let Some(timer) = self.back_timer.take() {
             timer.remove();
         }
         self.update_arrange_hint();
@@ -1322,13 +1326,6 @@ impl Ui {
         }
     }
 
-    /// From the power menu: back to the main row, where Enter picks tiles up.
-    fn start_arranging(&self) {
-        self.main_row();
-        self.arranging.set(true);
-        self.update_arrange_hint();
-    }
-
     /// Puts every row back in the configured order and forgets the saved one.
     fn reset_order(&self) {
         // If the saved order cannot be removed it would come back at the next start, so
@@ -1353,17 +1350,7 @@ impl Ui {
     }
 
     fn update_arrange_hint(&self) {
-        let text = if self.picked.borrow().is_some() {
-            Some(PICKED_HINT)
-        } else if self.arranging.get() {
-            Some(if self.on_main_page() {
-                ARRANGING_HINT
-            } else {
-                ARRANGING_IN_SUBMENU_HINT
-            })
-        } else {
-            None
-        };
+        let text = self.picked.borrow().is_some().then_some(PICKED_HINT);
         if let Some(text) = text {
             self.arrange_hint.set_label(text);
         }
@@ -1526,10 +1513,6 @@ impl Ui {
             }
             Command::Config(Action::Builtin(Builtin::Shutdown)) => self.power(entry, "poweroff"),
             Command::Config(Action::Builtin(Builtin::Restart)) => self.power(entry, "reboot"),
-            Command::Arrange => {
-                self.start_arranging();
-                Ok(())
-            }
             Command::ResetOrder => {
                 self.reset_order();
                 Ok(())
@@ -1631,8 +1614,10 @@ impl Ui {
                     return;
                 }
             }
-            if let Some(Request::Tile(name, action)) = request {
-                ui.start(&name, &action);
+            match request {
+                Some(Request::Tile(name, action)) => ui.start(&name, &action),
+                Some(Request::Desktop) => ui.hide_for_desktop(),
+                Some(Request::Home) | None => {}
             }
         });
     }
@@ -1881,18 +1866,6 @@ fn own_pages() -> Vec<OwnPage> {
                     Command::Config(Action::Builtin(Builtin::DesktopMode)),
                 ),
                 entry(
-                    "Arrange Tiles",
-                    "view-list-symbolic",
-                    "Pick tiles up and move them",
-                    Command::Arrange,
-                ),
-                entry(
-                    "Reset Tile Order",
-                    "edit-undo-symbolic",
-                    "Put the tiles back in the configured order",
-                    Command::ResetOrder,
-                ),
-                entry(
                     "Restart",
                     "system-reboot-symbolic",
                     "Restart the HTPC",
@@ -2067,7 +2040,7 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 mod tests {
     use super::{
         is_back, is_enter, is_navigation, order_listing, own_pages, row_layout, CloseQueue,
-        Command, Confirmable, Page, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
+        Command, Confirmable, Page, Request, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -2173,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn the_power_menu_offers_desktop_mode_arranging_reset_restart_and_shutdown() {
+    fn the_power_menu_offers_desktop_mode_restart_and_shutdown() {
         let pages = own_pages();
         let power = pages.iter().find(|own| own.page == Page::Power).unwrap();
         let commands: Vec<_> = power.tiles.iter().map(|tile| &tile.command).collect();
@@ -2181,8 +2154,6 @@ mod tests {
             commands,
             [
                 &Command::Config(Action::Builtin(Builtin::DesktopMode)),
-                &Command::Arrange,
-                &Command::ResetOrder,
                 &Command::Config(Action::Builtin(Builtin::Restart)),
                 &Command::Config(Action::Builtin(Builtin::Shutdown)),
             ]
@@ -2227,7 +2198,6 @@ mod tests {
             (config(Action::Flatpak("a.b".into())), false),
             (config(Action::Submenu("Games".into())), false),
             (Command::Cancel, false),
-            (Command::Arrange, false),
         ] {
             assert_eq!(Confirmable::of(&command).is_some(), needs, "{command:?}");
         }
@@ -2357,10 +2327,13 @@ mod tests {
     }
 
     #[test]
-    fn desktop_mode_cancels_the_pending_request() {
+    fn desktop_mode_during_a_close_replaces_the_pending_request() {
         let queue = CloseQueue::new();
-        assert!(queue.submit("brave"));
-        queue.cancel();
-        assert_eq!(queue.finish(), None);
+        assert!(queue.submit(Request::Tile(
+            "Brave".into(),
+            Action::Command("brave".into())
+        )));
+        assert!(!queue.submit(Request::Desktop));
+        assert!(matches!(queue.finish(), Some(Request::Desktop)));
     }
 }
