@@ -2,37 +2,31 @@
 //! each submenu), with keyboard and mouse navigation. Also theater and desktop mode:
 //! the launcher is shown full screen, or hidden to leave the GNOME desktop.
 
+use crate::catalog;
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
 use crate::diagnose;
+use crate::grid::{self, TileGrid, ICON_SIZE, PAGE_MARGIN, TILE_MIN};
 use crate::keybinding;
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
+use crate::tiles::{self, Addable};
 use crate::widgets::{hint, label};
-use crate::{launch, order};
+use crate::{launch, order, webapp};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
-const PAGE_MARGIN: i32 = 96;
-const TILE_SPACING: i32 = 40;
-/// Tiles are this big when the screen has room, and shrink to fit the row on it.
-const TILE_MAX: i32 = 200;
-const TILE_MIN: i32 = 100;
-/// The least gap between tiles of a long row, wide enough for a focused tile, which is
-/// drawn larger, not to cover its neighbours much.
-const TILE_MIN_SPACING: i32 = 16;
-const ICON_SIZE: i32 = 96;
 const LOGO_WIDTH: i32 = 200;
 const POINTER_IDLE: Duration = Duration::from_secs(3);
 const QUICK_FAILURE: Duration = Duration::from_secs(5);
-/// Holding Enter on a tile this long picks it up.
+/// Holding Enter on a tile this long opens its options.
 const LONG_PRESS: Duration = Duration::from_millis(600);
 /// Shown when the previous app was still running at the time limit.
 const NOT_CLOSED: &str = "Couldn't close the previous app";
-const PICKED_HINT: &str = "← →  move  ·  Enter  drop  ·  Back  cancel";
+const PICKED_HINT: &str = "← → ↑ ↓  move  ·  Enter  drop  ·  Back  cancel";
 /// Holding Back on the main row this long asks to reset the tile order.
 const RESET_HOLD: Duration = Duration::from_secs(2);
 
@@ -45,14 +39,28 @@ enum Command {
     Cancel,
     /// Puts the tiles back in the configured order. Its confirmation has it.
     ResetOrder,
+    /// Opens a service of the catalog as a web app.
+    Web(&'static catalog::App),
+    /// Puts something on the launcher; a choice on the Add page.
+    Add(Addable),
+    /// Picks the tile of the options page up, to move it.
+    Move,
+    /// Takes the tile of the options page off the launcher. Its confirmation has it.
+    Remove,
 }
 
 impl Command {
-    /// Whether the app behind it is installed; only a configured app can be missing.
-    fn is_installed(&self) -> bool {
+    /// Whether the app behind it is installed; only a configured app, or a web app
+    /// without a browser (`browser` is the configured one, if any), can be missing.
+    fn is_installed(&self, browser: Option<&str>) -> bool {
         match self {
             Command::Config(action) => launch::is_installed(action),
-            Command::Cancel | Command::ResetOrder => true,
+            Command::Web(_) => webapp::find_browser(browser).is_some(),
+            Command::Cancel
+            | Command::ResetOrder
+            | Command::Add(_)
+            | Command::Move
+            | Command::Remove => true,
         }
     }
 }
@@ -88,6 +96,10 @@ enum Page {
     Submenu(String),
     Power,
     Confirm(Confirmable),
+    /// What can be put on the launcher; made again each time it opens.
+    Add,
+    /// Move or remove the tile `Ui::options_for` names.
+    TileOptions,
 }
 
 /// What a confirmation page asks about: the actions that power the machine off or
@@ -97,6 +109,7 @@ enum Confirmable {
     Shutdown,
     Restart,
     ResetOrder,
+    RemoveTile,
 }
 
 impl Confirmable {
@@ -106,6 +119,7 @@ impl Confirmable {
             Command::Config(Action::Builtin(Builtin::Shutdown)) => Some(Confirmable::Shutdown),
             Command::Config(Action::Builtin(Builtin::Restart)) => Some(Confirmable::Restart),
             Command::ResetOrder => Some(Confirmable::ResetOrder),
+            Command::Remove => Some(Confirmable::RemoveTile),
             Command::Config(
                 Action::Builtin(Builtin::DesktopMode)
                 | Action::Command(_)
@@ -113,7 +127,10 @@ impl Confirmable {
                 | Action::Flatpak(_)
                 | Action::Submenu(_),
             )
-            | Command::Cancel => None,
+            | Command::Cancel
+            | Command::Web(_)
+            | Command::Add(_)
+            | Command::Move => None,
         }
     }
 
@@ -122,6 +139,7 @@ impl Confirmable {
             Confirmable::Shutdown => "shutdown",
             Confirmable::Restart => "restart",
             Confirmable::ResetOrder => "reset",
+            Confirmable::RemoveTile => "remove",
         }
     }
 }
@@ -129,6 +147,8 @@ impl Confirmable {
 impl Page {
     const MAIN: &'static str = "main";
     const POWER: &'static str = "power";
+    const ADD: &'static str = "add";
+    const TILE_OPTIONS: &'static str = "options";
     const SUBMENU_PREFIX: &'static str = "submenu:";
     const CONFIRM_PREFIX: &'static str = "confirm:";
 
@@ -137,6 +157,8 @@ impl Page {
             Page::Main => Self::MAIN.to_owned(),
             Page::Submenu(name) => format!("{}{name}", Self::SUBMENU_PREFIX),
             Page::Power => Self::POWER.to_owned(),
+            Page::Add => Self::ADD.to_owned(),
+            Page::TileOptions => Self::TILE_OPTIONS.to_owned(),
             Page::Confirm(confirm) => format!("{}{}", Self::CONFIRM_PREFIX, confirm.key()),
         }
     }
@@ -151,6 +173,7 @@ impl Page {
                 Confirmable::Shutdown,
                 Confirmable::Restart,
                 Confirmable::ResetOrder,
+                Confirmable::RemoveTile,
             ]
             .into_iter()
             .find(|confirm| confirm.key() == action)
@@ -159,6 +182,8 @@ impl Page {
         match key {
             Self::MAIN => Some(Page::Main),
             Self::POWER => Some(Page::Power),
+            Self::ADD => Some(Page::Add),
+            Self::TILE_OPTIONS => Some(Page::TileOptions),
             _ => None,
         }
     }
@@ -252,9 +277,10 @@ pub fn command_line(
 }
 
 /// The tiles of the main row and of each submenu, in the order the launcher shows them:
-/// the arrangement in `saved` over the configured order. One page per heading, one tile
-/// per line.
-pub fn order_listing(config: &Config, saved: &crate::order::Saved) -> String {
+/// the arrangement in `saved` over the configured order, with the services that were
+/// added and without the tiles that were removed (`shown`). One page per heading, one
+/// tile per line.
+pub fn order_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles::Shown) -> String {
     let mut listing = String::new();
     let main = (Page::Main, "main".to_owned(), &config.tiles);
     let submenus = config.submenus.iter().map(|(name, tiles)| {
@@ -264,11 +290,14 @@ pub fn order_listing(config: &Config, saved: &crate::order::Saved) -> String {
             tiles,
         )
     });
-    for (page, heading, tiles) in std::iter::once(main).chain(submenus) {
-        let names: Vec<&str> = tiles.iter().map(|tile| tile.name.as_str()).collect();
-        let shown = crate::order::arrange(&names, saved.get(&page.key()));
+    for (page, heading, page_tiles) in std::iter::once(main).chain(submenus) {
+        let configured: Vec<&str> = page_tiles.iter().map(|tile| tile.name.as_str()).collect();
+        let key = page.key();
+        let listed = tiles::listed(&key, &configured, shown);
+        let names: Vec<&str> = listed.iter().map(|(_, name)| name.as_str()).collect();
+        let order = tiles::visible(&key, &names, shown, saved.get(&key));
         listing.push_str(&format!("{heading}:\n"));
-        for (position, index) in shown.into_iter().enumerate() {
+        for (position, index) in order.into_iter().enumerate() {
             listing.push_str(&format!("  {}. {}\n", position + 1, names[index]));
         }
     }
@@ -435,18 +464,19 @@ impl<T> CloseQueue<T> {
     }
 }
 
-/// A row of tiles the user can rearrange: the main row and the configured submenus.
+/// The tiles of a page the user can rearrange: the main row and the configured submenus.
 struct Arrangeable {
-    row: gtk::Box,
-    /// In configured order, so a button's position here is its index for `Ui::tile`.
-    buttons: Vec<gtk::Button>,
+    grid: Rc<TileGrid>,
+    /// Each shown tile with its index for `Ui::tile`, in that order. A tile that was
+    /// removed has no button.
+    buttons: Vec<(usize, gtk::Button)>,
 }
 
 /// The tile picked up for moving.
 struct Picked {
     page: Page,
     button: gtk::Button,
-    /// Its place in the row when picked up, to put it back on cancel.
+    /// Its place among the tiles when picked up, to put it back on cancel.
     from: usize,
 }
 
@@ -458,8 +488,9 @@ struct Ui {
     submenus: RefCell<BTreeMap<String, Vec<Entry>>>,
     /// Holds the background, which a reload may change.
     overlay: gtk::Overlay,
-    /// The width the rows were last fitted to, for the rows of a reload.
+    /// The size the tiles were last fitted to, for the pages of a reload.
     width: Cell<i32>,
+    height: Cell<i32>,
     /// What a reload on showing the launcher last complained about, so a file that
     /// stays broken is reported once.
     reload_error: RefCell<Option<String>>,
@@ -470,8 +501,18 @@ struct Ui {
     /// The main-row tile that led to `running`: the tile itself, or the one that opens
     /// the submenu it is in. Selected when the launcher comes back; kept in memory only.
     origin: RefCell<Option<glib::WeakRef<gtk::Button>>>,
-    /// The round button beside the clock, selected when the main row has no tiles.
+    /// What the user added to the launcher and removed from it.
+    shown: RefCell<tiles::Shown>,
+    /// The round buttons beside the clock; "+" is selected when the main row has no
+    /// tiles.
+    plus_button: gtk::Button,
     power_button: gtk::Button,
+    /// The tile the options page is about: its page, and its index for `Ui::tile`.
+    options_for: RefCell<Option<(Page, usize)>>,
+    /// The tiles of the Add page, made each time it opens.
+    add_entries: RefCell<Vec<Entry>>,
+    /// The title label of each page that has one, for the pages whose title changes.
+    titles: RefCell<HashMap<Page, gtk::Label>>,
     /// Serialises closes; see `close_then`.
     closes: CloseQueue<Request>,
     stack: gtk::Stack,
@@ -483,8 +524,8 @@ struct Ui {
     labels: RefCell<HashMap<Page, (gtk::Label, gtk::Label)>>,
     /// Tiles (page and configured index) whose app was not installed when last checked.
     missing: RefCell<HashSet<(Page, usize)>>,
-    /// The row of tiles on each page, resized to the window by `fit_tiles`.
-    rows: RefCell<Vec<gtk::Box>>,
+    /// The tiles of each page, resized to the window by `fit_tiles`.
+    rows: RefCell<Vec<Rc<TileGrid>>>,
     /// Pages left by opening a submenu, with the tile that opened each.
     history: RefCell<Vec<(Page, gtk::Button)>>,
     /// Hover selects a tile only while the pointer is shown, so a tile moving under a
@@ -504,6 +545,13 @@ struct Ui {
     enter_down: Cell<bool>,
     /// Counts down a long press of Enter on a tile.
     enter_timer: RefCell<Option<glib::SourceId>>,
+    /// A long press of Enter opened the options; the rest of the press, its keyboard
+    /// auto-repeat, must not reach the page that opened.
+    enter_swallow: Cell<bool>,
+    /// An Enter press is under way (down since its first press, auto-repeat included),
+    /// to tell the repeat of a press that something else dealt with, which must not
+    /// act on the page that press opened, from a new press.
+    enter_held: Cell<bool>,
     /// Back is held down on the main row; like `enter_down`, so auto-repeat does not
     /// start the timer again.
     back_down: Cell<bool>,
@@ -534,6 +582,7 @@ impl Ui {
 
         let clock = Clock::new();
         let power_button = power_button();
+        let plus_button = plus_button();
         let corner = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(40)
@@ -542,6 +591,7 @@ impl Ui {
             .margin_top(64)
             .margin_end(PAGE_MARGIN)
             .build();
+        corner.append(&plus_button);
         corner.append(&power_button);
         corner.append(&clock.widget);
         overlay.add_overlay(&corner);
@@ -549,7 +599,9 @@ impl Ui {
         let arrange_hint = label("arrange-hint");
         arrange_hint.set_halign(gtk::Align::Center);
         arrange_hint.set_valign(gtk::Align::Start);
-        arrange_hint.set_margin_top(180);
+        // In the header, between the greeting and the buttons: the tiles may fill the
+        // rest of the screen.
+        arrange_hint.set_margin_top(84);
         arrange_hint.set_visible(false);
         arrange_hint.set_can_target(false);
         overlay.add_overlay(&arrange_hint);
@@ -579,24 +631,27 @@ impl Ui {
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&overlay));
 
-        let main = config.tiles.iter().map(Entry::from).collect();
-        let submenus = config
-            .submenus
-            .iter()
-            .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
-            .collect();
+        let shown = tiles::Shown::load();
+        let main = main_entries(&config, &shown);
+        let submenus = submenu_entries(&config);
         let ui = Rc::new(Ui {
             config: RefCell::new(config),
             main: RefCell::new(main),
             submenus: RefCell::new(submenus),
             overlay: overlay.clone(),
             width: Cell::new(0),
+            height: Cell::new(0),
             reload_error: RefCell::default(),
             window: window.clone(),
             toasts,
             running: RefCell::default(),
             origin: RefCell::default(),
+            shown: RefCell::new(shown),
+            plus_button: plus_button.clone(),
             power_button: power_button.clone(),
+            options_for: RefCell::default(),
+            add_entries: RefCell::default(),
+            titles: RefCell::default(),
             closes: CloseQueue::new(),
             stack,
             own_pages: own_pages(),
@@ -614,6 +669,8 @@ impl Ui {
             picked: RefCell::default(),
             enter_down: Cell::new(false),
             enter_timer: RefCell::default(),
+            enter_swallow: Cell::new(false),
+            enter_held: Cell::new(false),
             back_down: Cell::new(false),
             back_timer: RefCell::default(),
             arrange_hint,
@@ -635,23 +692,33 @@ impl Ui {
                 ui.open(Page::Power, button);
             }
         });
-        // The power button belongs to the main row only.
+        plus_button.connect_clicked({
+            let ui = ui.clone();
+            move |button| {
+                ui.sounds.chosen();
+                ui.stop_arranging();
+                ui.open_add(button);
+            }
+        });
+        // The round buttons belong to the main row only.
         ui.stack.connect_visible_child_name_notify({
-            let (ui, power_button) = (ui.clone(), power_button.clone());
+            let (ui, power_button, plus_button) =
+                (ui.clone(), power_button.clone(), plus_button.clone());
             move |stack| {
                 // The hint says what Back does, which depends on the page.
                 ui.update_arrange_hint();
-                power_button.set_visible(
-                    stack
-                        .visible_child_name()
-                        .and_then(|name| Page::from_key(&name))
-                        == Some(Page::Main),
-                );
+                let on_main = stack
+                    .visible_child_name()
+                    .and_then(|name| Page::from_key(&name))
+                    == Some(Page::Main);
+                power_button.set_visible(on_main);
+                plus_button.set_visible(on_main);
             }
         });
 
-        // GTK's arrow keys do not reach the button from the tiles, so Up and Down
-        // cross between them here. Down goes back to the tile Up left.
+        // GTK's arrow keys do not reach the buttons from the tiles, so Up and Down
+        // cross between them here: Up from the top row selects "+", Left and Right
+        // move between it and the power button. Down goes back to the tile Up left.
         let keys = gtk::EventControllerKey::new();
         let last_tile: Rc<RefCell<Option<gtk::Widget>>> = Rc::default();
         keys.connect_key_pressed({
@@ -674,13 +741,19 @@ impl Ui {
                     ui.sounds.chosen();
                     glib::Propagation::Stop
                 }
-                gtk::gdk::Key::Up if ui.on_main_page() && !power_button.is_focus() => {
+                // From the top row only: Up in a lower row moves up a row.
+                gtk::gdk::Key::Up
+                    if ui.on_main_page()
+                        && !power_button.is_focus()
+                        && !plus_button.is_focus()
+                        && ui.in_top_row() =>
+                {
                     last_tile.replace(GtkWindowExt::focus(&ui.window));
-                    power_button.grab_focus();
+                    plus_button.grab_focus();
                     ui.sounds.moved();
                     glib::Propagation::Stop
                 }
-                gtk::gdk::Key::Down if power_button.is_focus() => {
+                gtk::gdk::Key::Down if power_button.is_focus() || plus_button.is_focus() => {
                     let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
                     if let Some(tile) = last_tile.take().or(first.map(Cast::upcast)) {
                         tile.grab_focus();
@@ -736,14 +809,30 @@ impl Ui {
         });
         window.add_controller(arranging);
 
-        // The window is as wide as the screen, whatever its resolution: the tiles are
+        // The window is as big as the screen, whatever its resolution: the tiles are
         // sized to that once the compositor reports it.
         window.connect_realize({
             let ui = ui.clone();
             move |window| {
                 if let Some(surface) = window.surface() {
                     let ui = ui.clone();
-                    surface.connect_layout(move |_, width, _| ui.fit_tiles(width));
+                    surface.connect_layout(move |_, width, height| ui.fit_tiles(width, height));
+                }
+            }
+        });
+
+        // An app that takes the focus while Enter is down gets its release, not the
+        // launcher: forget the press, or the next one would be taken for a repeat.
+        window.connect_is_active_notify({
+            let ui = ui.clone();
+            move |window| {
+                if !window.is_active() {
+                    ui.enter_held.set(false);
+                    ui.enter_swallow.set(false);
+                    ui.enter_down.set(false);
+                    if let Some(timer) = ui.enter_timer.take() {
+                        timer.remove();
+                    }
                 }
             }
         });
@@ -755,7 +844,7 @@ impl Ui {
         window.set_content(Some(&ui.toasts));
         keybinding::sync(ui.config.borrow().home_key.as_deref());
         let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
-        GtkWindowExt::set_focus(window, first.as_ref().or(Some(&ui.power_button)));
+        GtkWindowExt::set_focus(window, first.as_ref().or(Some(&ui.plus_button)));
         ui
     }
 
@@ -781,7 +870,7 @@ impl Ui {
                     }
                     return;
                 }
-                self.rebuild(config);
+                self.rebuild(Some(config));
                 self.notify("Configuration reloaded");
             }
             Err(error) => {
@@ -799,7 +888,7 @@ impl Ui {
 
     /// Replaces the pages made from the configuration with ones made from `config`. The
     /// other pages and everything about the open app stay.
-    fn rebuild(self: &Rc<Self>, config: Config) {
+    fn rebuild(self: &Rc<Self>, config: Option<Config>) {
         // Leaves any submenu and arranging first, so no stale button is left selected.
         self.main_row();
         let transition = self.stack.transition_type();
@@ -834,30 +923,33 @@ impl Ui {
         self.missing
             .borrow_mut()
             .retain(|(page, _)| !from_config(page));
+        self.titles
+            .borrow_mut()
+            .retain(|page, _| !from_config(page));
         self.arrangeable
             .borrow_mut()
             .retain(|page, _| !from_config(page));
-        self.rows.borrow_mut().retain(|row| row.root().is_some());
+        self.rows
+            .borrow_mut()
+            .retain(|row| row.widget().root().is_some());
 
-        let home_key_changed = config.home_key != self.config.borrow().home_key;
-        if config.background != self.config.borrow().background {
-            let background = background_widget(config.background.as_deref());
-            self.overlay.set_child(Some(&background));
+        if let Some(config) = config {
+            let home_key_changed = config.home_key != self.config.borrow().home_key;
+            if config.background != self.config.borrow().background {
+                let background = background_widget(config.background.as_deref());
+                self.overlay.set_child(Some(&background));
+            }
+            *self.config.borrow_mut() = config;
+            if home_key_changed {
+                keybinding::sync(self.config.borrow().home_key.as_deref());
+            }
         }
-        *self.main.borrow_mut() = config.tiles.iter().map(Entry::from).collect();
-        *self.submenus.borrow_mut() = config
-            .submenus
-            .iter()
-            .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
-            .collect();
-        *self.config.borrow_mut() = config;
-        if home_key_changed {
-            keybinding::sync(self.config.borrow().home_key.as_deref());
-        }
+        *self.main.borrow_mut() = main_entries(&self.config.borrow(), &self.shown.borrow());
+        *self.submenus.borrow_mut() = submenu_entries(&self.config.borrow());
 
         self.add_config_pages();
         if self.width.get() > 0 {
-            self.fit_tiles(self.width.get());
+            self.fit_tiles(self.width.get(), self.height.get());
         }
         self.stack.set_visible_child_name(&Page::Main.key());
         self.stack.set_transition_type(transition);
@@ -907,7 +999,7 @@ impl Ui {
         while self.back() {}
         match self.first_tiles.borrow().get(&Page::Main) {
             Some(first) => first.grab_focus(),
-            None => self.power_button.grab_focus(),
+            None => self.plus_button.grab_focus(),
         };
     }
 
@@ -963,41 +1055,40 @@ impl Ui {
             .margin_end(PAGE_MARGIN)
             .build();
 
-        column.append(&self.header(submenu));
+        column.append(&self.header(&page, submenu));
 
-        let row = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(TILE_SPACING)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::End)
-            .vexpand(true)
-            .build();
-        column.append(&row);
+        let row = TileGrid::new(&column);
+        column.append(row.widget());
+
+        let positions: Vec<usize> = if arrangeable {
+            let names: Vec<&str> = tiles.iter().map(|tile| tile.name.as_str()).collect();
+            tiles::visible(
+                &page.key(),
+                &names,
+                &self.shown.borrow(),
+                self.saved_order.borrow().get(&page.key()),
+            )
+        } else {
+            (0..tiles.len()).collect()
+        };
 
         let name = label("tile-name");
         name.set_margin_top(44);
         let description = label("tile-description");
         description.set_margin_top(10);
-        if page == Page::Main && tiles.is_empty() {
-            name.set_label("No tiles configured");
-            description.set_label(&format!(
-                "Add tiles to {}",
-                Config::default_path().display()
-            ));
+        if positions.is_empty() {
+            if let Some((title, detail)) = empty_page_text(&page) {
+                name.set_label(title);
+                description.set_label(detail);
+            }
         }
         self.labels
             .borrow_mut()
             .insert(page.clone(), (name.clone(), description.clone()));
         column.append(&name);
         column.append(&description);
-        column.append(&self.hints(submenu.is_some(), !tiles.is_empty()));
+        column.append(&self.hints(submenu.is_some(), !positions.is_empty()));
 
-        let positions = if arrangeable {
-            let names: Vec<_> = tiles.iter().map(|tile| tile.name.as_str()).collect();
-            order::arrange(&names, self.saved_order.borrow().get(&page.key()))
-        } else {
-            (0..tiles.len()).collect()
-        };
         let mut buttons = Vec::new();
         for (position, index) in positions.into_iter().enumerate() {
             let tile = &tiles[index];
@@ -1037,6 +1128,26 @@ impl Ui {
             });
             button.add_controller(hover);
 
+            // A right click opens the tile's options, as Menu does.
+            if arrangeable {
+                let secondary = gtk::GestureClick::builder()
+                    .button(gtk::gdk::BUTTON_SECONDARY)
+                    .build();
+                secondary.connect_pressed({
+                    let (ui, page, button) = (self.clone(), page.clone(), button.downgrade());
+                    move |_, _, _, _| {
+                        let Some(button) = button.upgrade() else {
+                            return;
+                        };
+                        if ui.picked.borrow().is_none() {
+                            button.grab_focus();
+                            ui.open_options(&page, &button);
+                        }
+                    }
+                });
+                button.add_controller(secondary);
+            }
+
             button.connect_clicked({
                 let (ui, page) = (self.clone(), page.clone());
                 move |button| {
@@ -1048,7 +1159,7 @@ impl Ui {
                 }
             });
 
-            row.append(&button);
+            row.push(&button);
             buttons.push((index, button));
         }
 
@@ -1057,13 +1168,25 @@ impl Ui {
             self.arrangeable.borrow_mut().insert(
                 page.clone(),
                 Arrangeable {
-                    row: row.clone(),
-                    buttons: buttons.into_iter().map(|(_, button)| button).collect(),
+                    grid: row.clone(),
+                    buttons,
                 },
             );
         }
         self.stack.add_named(&column, Some(&page.key()));
         self.rows.borrow_mut().push(row);
+    }
+
+    /// Whether the selected tile of the main page is in its top row (or nothing there is
+    /// selected), so Up leaves the tiles for the buttons above them.
+    fn in_top_row(&self) -> bool {
+        let focus =
+            GtkWindowExt::focus(&self.window).and_then(|f| f.downcast::<gtk::Button>().ok());
+        let arrangeable = self.arrangeable.borrow();
+        match (focus, arrangeable.get(&Page::Main)) {
+            (Some(button), Some(tiles)) => tiles.grid.row_of(&button).is_none_or(|row| row == 0),
+            _ => true,
+        }
     }
 
     /// The tile with keyboard focus on the visible page, if that page can be rearranged.
@@ -1072,14 +1195,15 @@ impl Ui {
         let focus = GtkWindowExt::focus(&self.window)?;
         let arrangeable = self.arrangeable.borrow();
         let tiles = arrangeable.get(&page)?;
-        let button = tiles
+        let (_, button) = tiles
             .buttons
             .iter()
-            .find(|b| b.upcast_ref::<gtk::Widget>() == &focus)?;
+            .find(|(_, b)| b.upcast_ref::<gtk::Widget>() == &focus)?;
         Some((page, button.clone()))
     }
 
-    /// Handles a key press that picks tiles up, moves or drops them. True if it did.
+    /// Handles a key press that opens a tile's options, or moves or drops a picked tile.
+    /// True if it did.
     fn arrange_key(self: &Rc<Self>, key: gtk::gdk::Key) -> bool {
         use gtk::gdk::Key;
         if is_enter(key) {
@@ -1089,10 +1213,12 @@ impl Ui {
             match key {
                 Key::Left => self.move_picked(-1),
                 Key::Right => self.move_picked(1),
+                Key::Up => self.move_picked_row(-1),
+                Key::Down => self.move_picked_row(1),
                 Key::Menu | Key::F2 => self.drop_picked(),
                 key if is_back(key) => self.cancel_picked(),
                 // The picked tile keeps the selection.
-                Key::Up | Key::Down | Key::Tab | Key::ISO_Left_Tab => {}
+                Key::Tab | Key::ISO_Left_Tab => {}
                 _ => return false,
             }
             return true;
@@ -1100,7 +1226,7 @@ impl Ui {
         match key {
             Key::Menu | Key::F2 => match self.focused_tile() {
                 Some((page, button)) => {
-                    self.pick_up(&page, &button);
+                    self.open_options(&page, &button);
                     true
                 }
                 None => false,
@@ -1142,10 +1268,18 @@ impl Ui {
     }
 
     /// Enter on a tile of a rearrangeable row: the tile opens when Enter is released,
-    /// unless it is held for [`LONG_PRESS`], which picks the tile up. With a tile picked
+    /// unless it is held for [`LONG_PRESS`], which opens its options. With a tile picked
     /// up, Enter drops it.
     /// True if the press is dealt with here, false to leave it to GTK.
     fn enter_pressed(self: &Rc<Self>) -> bool {
+        if self.enter_swallow.get() {
+            return true;
+        }
+        // A repeat of a press that was not ours (GTK activated a button with it, and the
+        // page it opened has the focus now): it must not activate that page's tile too.
+        if self.enter_held.replace(true) && !self.enter_down.get() {
+            return true;
+        }
         let picked = self.picked.borrow().is_some();
         let tile = if picked { None } else { self.focused_tile() };
         if !picked && tile.is_none() {
@@ -1163,7 +1297,8 @@ impl Ui {
                     LONG_PRESS,
                     move || {
                         ui.enter_timer.take();
-                        ui.pick_up(&page, &button);
+                        ui.enter_swallow.set(true);
+                        ui.open_options(&page, &button);
                     },
                 )));
             }
@@ -1174,6 +1309,8 @@ impl Ui {
     /// A tap of Enter on a tile opens it now that the key is up; after a long press the
     /// tile was already picked up, and there is nothing to do.
     fn enter_released(&self) {
+        self.enter_swallow.set(false);
+        self.enter_held.set(false);
         if !self.enter_down.replace(false) {
             return;
         }
@@ -1201,9 +1338,7 @@ impl Ui {
             let Some(tiles) = arrangeable.get(page) else {
                 return;
             };
-            children(&tiles.row)
-                .iter()
-                .position(|child| child == button.upcast_ref::<gtk::Widget>())
+            tiles.grid.position(button)
         };
         let Some(from) = from else {
             return;
@@ -1218,8 +1353,21 @@ impl Ui {
         self.update_arrange_hint();
     }
 
-    /// Moves the picked tile one place along its row; it stays where it is at either end.
+    /// Moves the picked tile one place along its row (continuing onto the next or
+    /// previous row); it stays where it is at either end.
     fn move_picked(&self, delta: isize) {
+        self.move_picked_to(|position, grid| order::step(position, delta, grid.len()));
+    }
+
+    /// Moves the picked tile one row up (-1) or down (+1), staying in its column.
+    fn move_picked_row(&self, rows: isize) {
+        self.move_picked_to(|position, grid| {
+            grid::step_row(position, rows, grid.columns(), grid.len())
+        });
+    }
+
+    /// Moves the picked tile to the place `target` gives from where it is now.
+    fn move_picked_to(&self, target: impl Fn(usize, &TileGrid) -> Option<usize>) {
         let picked = self.picked.borrow();
         let arrangeable = self.arrangeable.borrow();
         let Some((picked, tiles)) = picked
@@ -1228,15 +1376,11 @@ impl Ui {
         else {
             return;
         };
-        let row = children(&tiles.row);
-        let Some(position) = row
-            .iter()
-            .position(|c| c == picked.button.upcast_ref::<gtk::Widget>())
-        else {
+        let Some(position) = tiles.grid.position(&picked.button) else {
             return;
         };
-        if let Some(target) = order::step(position, delta, row.len()) {
-            place(&tiles.row, &picked.button, target);
+        if let Some(target) = target(position, &tiles.grid) {
+            tiles.grid.move_to(&picked.button, target);
             self.sounds.moved();
         }
     }
@@ -1262,7 +1406,7 @@ impl Ui {
         };
         picked.button.remove_css_class("picked");
         if let Some(tiles) = self.arrangeable.borrow().get(&picked.page) {
-            place(&tiles.row, &picked.button, picked.from);
+            tiles.grid.move_to(&picked.button, picked.from);
         }
         self.refresh_first(&picked.page);
         picked.button.grab_focus();
@@ -1285,42 +1429,54 @@ impl Ui {
         self.update_arrange_hint();
     }
 
-    /// The tile order of the page, as the row shows it now.
+    /// The names of a page's tiles in its list, which every index of the page refers to.
+    fn listed_names(&self, page: &Page) -> Vec<String> {
+        match page {
+            Page::Main => self.main.borrow().iter().map(|e| e.name.clone()).collect(),
+            Page::Submenu(name) => self
+                .submenus
+                .borrow()
+                .get(name)
+                .map(|tiles| tiles.iter().map(|e| e.name.clone()).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The tile order of the page, as the row shows it now; the tiles that were removed
+    /// keep the places they had.
     fn save_order(&self, page: &Page) {
-        let names: Vec<order::Identity> = {
+        let names = self.listed_names(page);
+        let configured: Vec<&str> = names.iter().map(String::as_str).collect();
+        let identities = order::identities(&configured);
+        let shown: Vec<order::Identity> = {
             let arrangeable = self.arrangeable.borrow();
             let Some(tiles) = arrangeable.get(page) else {
                 return;
             };
-            let names: Vec<String> = (0..tiles.buttons.len())
-                .map(|index| self.tile(page, index).name)
-                .collect();
-            let configured: Vec<&str> = names.iter().map(String::as_str).collect();
-            let identities = order::identities(&configured);
-            children(&tiles.row)
+            tiles
+                .grid
+                .buttons()
                 .iter()
-                .filter_map(|child| {
-                    tiles
-                        .buttons
-                        .iter()
-                        .position(|button| button.upcast_ref::<gtk::Widget>() == child)
-                })
-                .map(|index| identities[index].clone())
+                .filter_map(|shown| tiles.buttons.iter().find(|(_, button)| button == shown))
+                .map(|(index, _)| identities[*index].clone())
                 .collect()
         };
         let mut saved = self.saved_order.borrow_mut();
-        saved.insert(page.key(), names);
+        let key = page.key();
+        let before = saved.get(&key).unwrap_or(&identities);
+        let order = tiles::order_to_save(before, shown, self.shown.borrow().hidden_on(&key));
+        saved.insert(key, order);
         order::save(&saved);
     }
 
     /// The first tile of a page is what is selected when it opens.
     fn refresh_first(&self, page: &Page) {
-        let first = self.arrangeable.borrow().get(page).and_then(|tiles| {
-            tiles
-                .row
-                .first_child()
-                .and_then(|child| child.downcast::<gtk::Button>().ok())
-        });
+        let first = self
+            .arrangeable
+            .borrow()
+            .get(page)
+            .and_then(|tiles| tiles.grid.first());
         if let Some(first) = first {
             self.first_tiles.borrow_mut().insert(page.clone(), first);
         }
@@ -1339,9 +1495,8 @@ impl Ui {
         let pages: Vec<Page> = self.arrangeable.borrow().keys().cloned().collect();
         for page in &pages {
             if let Some(tiles) = self.arrangeable.borrow().get(page) {
-                for (index, button) in tiles.buttons.iter().enumerate() {
-                    place(&tiles.row, button, index);
-                }
+                let configured = tiles.buttons.iter().map(|(_, b)| b.clone()).collect();
+                tiles.grid.set_order(configured);
             }
             self.refresh_first(page);
         }
@@ -1357,33 +1512,17 @@ impl Ui {
         self.arrange_hint.set_visible(text.is_some());
     }
 
-    /// Sizes every row's tiles to fit a window `width` logical pixels wide, so the
-    /// last tile is never pushed off a small screen.
-    fn fit_tiles(&self, width: i32) {
+    /// Sizes and places every page's tiles to fit a window `width` by `height` logical
+    /// pixels, so none is pushed off a small screen: they wrap onto more rows.
+    fn fit_tiles(&self, width: i32, height: i32) {
         self.width.set(width);
+        self.height.set(height);
         for row in self.rows.borrow().iter() {
-            let mut tiles = Vec::new();
-            let mut child = row.first_child();
-            while let Some(tile) = child {
-                child = tile.next_sibling();
-                tiles.push(tile);
-            }
-            let (size, spacing) = row_layout(width, tiles.len());
-            row.set_spacing(spacing);
-            for tile in tiles {
-                tile.set_size_request(size, size);
-                if let Some(icon) = tile
-                    .downcast_ref::<gtk::Button>()
-                    .and_then(|button| button.child())
-                    .and_then(|child| child.downcast::<gtk::Image>().ok())
-                {
-                    icon.set_pixel_size(size * ICON_SIZE / TILE_MAX);
-                }
-            }
+            row.fit(width, height);
         }
     }
 
-    fn header(&self, submenu: Option<&str>) -> gtk::Box {
+    fn header(&self, page: &Page, submenu: Option<&str>) -> gtk::Box {
         let header = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
@@ -1405,6 +1544,7 @@ impl Ui {
                 header.append(&hint("Esc", "Back"));
                 let title = label("greeting");
                 title.set_label(name);
+                self.titles.borrow_mut().insert(page.clone(), title.clone());
                 header.append(&title);
             }
         }
@@ -1436,11 +1576,16 @@ impl Ui {
         hints
     }
 
+    /// Whether the app behind `command` is installed.
+    fn installed(&self, command: &Command) -> bool {
+        command.is_installed(self.config.borrow().browser.as_deref())
+    }
+
     /// Marks the tile `button` (tile `index` of `page`) as missing, dimmed, if its app is
     /// not installed, and as present otherwise.
     fn check_installed(&self, page: &Page, index: usize, button: &gtk::Button) {
         let key = (page.clone(), index);
-        if self.tile(page, index).command.is_installed() {
+        if self.installed(&self.tile(page, index).command) {
             self.missing.borrow_mut().remove(&key);
             button.remove_css_class("unavailable");
         } else {
@@ -1453,10 +1598,10 @@ impl Ui {
     /// brings the description of the selected tile up to date.
     fn refresh_installed(&self) {
         for (page, tiles) in self.arrangeable.borrow().iter() {
-            for (index, button) in tiles.buttons.iter().enumerate() {
-                self.check_installed(page, index, button);
+            for (index, button) in tiles.buttons.iter() {
+                self.check_installed(page, *index, button);
                 if button.is_focus() {
-                    self.show_tile(page, index);
+                    self.show_tile(page, *index);
                 }
             }
         }
@@ -1482,7 +1627,8 @@ impl Ui {
         match page {
             Page::Main => self.main.borrow()[index].clone(),
             Page::Submenu(name) => self.submenus.borrow()[name][index].clone(),
-            Page::Power | Page::Confirm(_) => self
+            Page::Add => self.add_entries.borrow()[index].clone(),
+            Page::Power | Page::Confirm(_) | Page::TileOptions => self
                 .own_pages
                 .iter()
                 .find(|own| own.page == *page)
@@ -1517,6 +1663,27 @@ impl Ui {
                 self.reset_order();
                 Ok(())
             }
+            Command::Add(offer) => {
+                self.add_tile(*offer);
+                Ok(())
+            }
+            Command::Move => {
+                self.begin_move();
+                Ok(())
+            }
+            // Only the confirmation's own tile gets here: the options page asks first.
+            Command::Remove => {
+                self.remove_selected();
+                Ok(())
+            }
+            Command::Web(_) if !self.installed(&entry.command) => {
+                self.notify(&format!(
+                    "{} needs a browser, and none is installed",
+                    entry.name
+                ));
+                Ok(())
+            }
+            Command::Web(app) => self.open_web_app(page, entry, app, button),
             Command::Cancel => {
                 self.back();
                 Ok(())
@@ -1524,7 +1691,7 @@ impl Ui {
             // Checked again here, not read from `missing`: the app may have been installed
             // since. Nothing is closed for an app that cannot start.
             Command::Config(Action::Command(_) | Action::Desktop(_) | Action::Flatpak(_))
-                if !entry.command.is_installed() =>
+                if !self.installed(&entry.command) =>
             {
                 self.notify(&format!("{} isn't installed", entry.name));
                 Ok(())
@@ -1667,6 +1834,233 @@ impl Ui {
         }
     }
 
+    /// Opens the options (move, remove) of the tile `button` of `page`.
+    fn open_options(&self, page: &Page, button: &gtk::Button) {
+        let index = self.arrangeable.borrow().get(page).and_then(|tiles| {
+            tiles
+                .buttons
+                .iter()
+                .find(|(_, shown)| shown == button)
+                .map(|(index, _)| *index)
+        });
+        let Some(index) = index else {
+            return;
+        };
+        let name = self.tile(page, index).name;
+        self.options_for.replace(Some((page.clone(), index)));
+        self.set_title(&Page::TileOptions, &name);
+        self.set_title(
+            &Page::Confirm(Confirmable::RemoveTile),
+            &format!("Remove {name}?"),
+        );
+        self.sounds.chosen();
+        self.open(Page::TileOptions, button);
+    }
+
+    fn set_title(&self, page: &Page, text: &str) {
+        if let Some(title) = self.titles.borrow().get(page) {
+            title.set_label(text);
+        }
+    }
+
+    /// Back from the options page to the tile, picked up for moving.
+    fn begin_move(&self) {
+        let Some((page, opener)) = self.history.borrow().last().cloned() else {
+            return;
+        };
+        if !matches!(page, Page::Main | Page::Submenu(_)) {
+            return;
+        }
+        self.options_for.take();
+        self.back();
+        self.pick_up(&page, &opener);
+    }
+
+    /// Takes the tile of the options page off the launcher: a service that was added is
+    /// forgotten, a configured tile is hidden. Either can be put back from "+".
+    fn remove_selected(self: &Rc<Self>) {
+        let Some((page, index)) = self.options_for.take() else {
+            return;
+        };
+        let entry = self.tile(&page, index);
+        let position = self.arrangeable.borrow().get(&page).and_then(|tiles| {
+            let (_, button) = tiles.buttons.iter().find(|(i, _)| *i == index)?;
+            tiles.grid.position(button)
+        });
+        match entry.command {
+            Command::Web(app) => self.shown.borrow_mut().remove(app.id),
+            _ => {
+                let names = self.listed_names(&page);
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                let identity = order::identities(&names)[index].clone();
+                self.shown.borrow_mut().hide(&page.key(), identity);
+            }
+        }
+        self.save_shown();
+        self.rebuild(None);
+        self.notify(&format!("Removed {}", entry.name));
+        // Back on the page it was removed from, on the tile that took its place, or the
+        // last one.
+        if self.reopen(&page) {
+            let button = self.arrangeable.borrow().get(&page).and_then(|tiles| {
+                let shown = tiles.grid.buttons();
+                shown.get(position.unwrap_or(0)).or(shown.last()).cloned()
+            });
+            if let Some(button) = button {
+                button.grab_focus();
+            }
+        }
+    }
+
+    /// Shows `page` again after the pages were rebuilt, which leaves them for the main
+    /// row: a submenu is opened from the main-row tile that leads to it. False if it
+    /// could not be, e.g. that tile was removed.
+    fn reopen(&self, page: &Page) -> bool {
+        let Page::Submenu(name) = page else {
+            return *page == Page::Main;
+        };
+        let opener = self
+            .arrangeable
+            .borrow()
+            .get(&Page::Main)
+            .and_then(|tiles| {
+                tiles
+                    .buttons
+                    .iter()
+                    .find(|(index, _)| {
+                        self.tile(&Page::Main, *index).command
+                            == Command::Config(Action::Submenu(name.clone()))
+                    })
+                    .map(|(_, button)| button.clone())
+            });
+        match opener {
+            Some(opener) => {
+                self.open(page.clone(), &opener);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Opens the Add page, made for what can be added now.
+    fn open_add(self: &Rc<Self>, opener: &gtk::Button) {
+        let key = Page::Add.key();
+        if let Some(old) = self.stack.child_by_name(&key) {
+            self.stack.remove(&old);
+        }
+        self.first_tiles.borrow_mut().remove(&Page::Add);
+        self.labels.borrow_mut().remove(&Page::Add);
+        self.titles.borrow_mut().remove(&Page::Add);
+        self.missing
+            .borrow_mut()
+            .retain(|(page, _)| *page != Page::Add);
+        self.rows
+            .borrow_mut()
+            .retain(|row| row.widget().root().is_some());
+
+        let entries = self.addable_entries();
+        *self.add_entries.borrow_mut() = entries.clone();
+        self.add_page(Page::Add, Some("Add a tile"), &entries, false);
+        if self.width.get() > 0 {
+            self.fit_tiles(self.width.get(), self.height.get());
+        }
+        self.open(Page::Add, opener);
+    }
+
+    /// What the Add page offers: removed tiles first, then the catalog.
+    fn addable_entries(&self) -> Vec<Entry> {
+        let pages = configured_pages(&self.config.borrow());
+        let names: Vec<(&str, Vec<&str>)> = pages
+            .iter()
+            .map(|(key, _, entries)| {
+                (
+                    key.as_str(),
+                    entries.iter().map(|entry| entry.name.as_str()).collect(),
+                )
+            })
+            .collect();
+        tiles::addable(&names, &self.shown.borrow())
+            .into_iter()
+            .map(|offer| match offer {
+                Addable::Hidden { page, index } => {
+                    let (_, label, entries) = &pages[page];
+                    let tile = &entries[index];
+                    Entry {
+                        description: Some(format!("Put back on {label}")),
+                        command: Command::Add(offer),
+                        ..tile.clone()
+                    }
+                }
+                Addable::Catalog(app) => Entry {
+                    command: Command::Add(offer),
+                    ..catalog_entry(app)
+                },
+            })
+            .collect()
+    }
+
+    /// Puts a choice of the Add page on the launcher, and selects it if it is on the
+    /// main row.
+    fn add_tile(self: &Rc<Self>, offer: Addable) {
+        let (name, page, toast) = match offer {
+            Addable::Catalog(app) => {
+                self.shown.borrow_mut().add(app.id);
+                (
+                    app.name.to_owned(),
+                    Page::Main,
+                    format!("Added {}", app.name),
+                )
+            }
+            Addable::Hidden { page, index } => {
+                let pages = configured_pages(&self.config.borrow());
+                let (key, label, entries) = &pages[page];
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                let identity = order::identities(&names)[index].clone();
+                self.shown.borrow_mut().unhide(key, &identity);
+                let name = entries[index].name.clone();
+                let toast = format!("Put {name} back on {label}");
+                (name, Page::from_key(key).unwrap_or(Page::Main), toast)
+            }
+        };
+        self.save_shown();
+        self.rebuild(None);
+        self.notify(&toast);
+        if page == Page::Main {
+            let button = self.arrangeable.borrow().get(&page).and_then(|tiles| {
+                tiles
+                    .buttons
+                    .iter()
+                    .find(|(index, _)| self.tile(&page, *index).name == name)
+                    .map(|(_, button)| button.clone())
+            });
+            if let Some(button) = button {
+                button.grab_focus();
+            }
+        }
+    }
+
+    fn save_shown(&self) {
+        if !self.shown.borrow().save() {
+            self.notify("Couldn't save the change; it is lost at the next start");
+        }
+    }
+
+    /// Opens a service of the catalog in the browser, closing the open app first.
+    fn open_web_app(
+        self: &Rc<Self>,
+        page: &Page,
+        entry: &Entry,
+        app: &'static catalog::App,
+        button: &gtk::Button,
+    ) -> anyhow::Result<()> {
+        let browser = webapp::find_browser(self.config.borrow().browser.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no browser"))?;
+        let line = webapp::prepare(app, &browser)?;
+        self.remember_origin(page, button);
+        self.launch(&entry.name, &Action::Command(line));
+        Ok(())
+    }
+
     fn open(&self, page: Page, opener: &gtk::Button) {
         self.history
             .borrow_mut()
@@ -1753,26 +2147,6 @@ fn hide_idle_pointer(widget: &impl IsA<gtk::Widget>, on_change: impl Fn(bool) + 
     widget.add_controller(motion);
 }
 
-/// The children of `row`, left to right.
-fn children(row: &gtk::Box) -> Vec<gtk::Widget> {
-    let mut children = Vec::new();
-    let mut child = row.first_child();
-    while let Some(widget) = child {
-        child = widget.next_sibling();
-        children.push(widget);
-    }
-    children
-}
-
-/// Moves `button` to `index` in `row`, the others keeping their order.
-fn place(row: &gtk::Box, button: &gtk::Button, index: usize) {
-    let others: Vec<_> = children(row)
-        .into_iter()
-        .filter(|child| child != button.upcast_ref::<gtk::Widget>())
-        .collect();
-    row.reorder_child_after(button, index.checked_sub(1).and_then(|i| others.get(i)));
-}
-
 /// Enter, and the select key of a TV remote.
 fn is_enter(key: gtk::gdk::Key) -> bool {
     use gtk::gdk::Key;
@@ -1804,27 +2178,6 @@ fn is_navigation(key: gtk::gdk::Key) -> bool {
         key,
         Key::Left | Key::Right | Key::Up | Key::Down | Key::Tab | Key::ISO_Left_Tab
     )
-}
-
-/// The side of the square tiles and the gap between them for a row of `count` tiles in
-/// a window `width` wide, such that the row always fits between the page margins.
-/// Tiles are [`TILE_MAX`] with [`TILE_SPACING`] if that fits; else they shrink down to
-/// [`TILE_MIN`]; then the gaps close up, down to [`TILE_MIN_SPACING`]; and only then do
-/// the tiles shrink further.
-fn row_layout(width: i32, count: usize) -> (i32, i32) {
-    let count = i32::try_from(count.max(1)).unwrap_or(i32::MAX);
-    let gaps = count - 1;
-    let room = (width - 2 * PAGE_MARGIN).max(count);
-    let size = (room - TILE_SPACING * gaps) / count;
-    if size >= TILE_MIN || gaps == 0 {
-        return (size.clamp(1, TILE_MAX), TILE_SPACING);
-    }
-    let spacing = (room - TILE_MIN * count) / gaps;
-    if spacing >= TILE_MIN_SPACING {
-        return (TILE_MIN, spacing);
-    }
-    let size = (room - TILE_MIN_SPACING * gaps) / count;
-    (size.clamp(1, TILE_MIN), TILE_MIN_SPACING)
 }
 
 /// A page the launcher adds itself: the power menu and its confirmations.
@@ -1879,6 +2232,39 @@ fn own_pages() -> Vec<OwnPage> {
                 ),
             ],
         },
+        // The title is the tile's name, set when the page opens.
+        OwnPage {
+            page: Page::TileOptions,
+            title: "Tile options",
+            tiles: vec![
+                cancel(),
+                entry(
+                    "Move",
+                    "list-drag-handle-symbolic",
+                    "Pick the tile up and put it somewhere else",
+                    Command::Move,
+                ),
+                entry(
+                    "Remove",
+                    "user-trash-symbolic",
+                    "Take the tile off the launcher",
+                    Command::Remove,
+                ),
+            ],
+        },
+        OwnPage {
+            page: Page::Confirm(Confirmable::RemoveTile),
+            title: "Remove?",
+            tiles: vec![
+                cancel(),
+                entry(
+                    "Remove",
+                    "user-trash-symbolic",
+                    "It can be added back with +",
+                    Command::Remove,
+                ),
+            ],
+        },
         OwnPage {
             page: Page::Confirm(Confirmable::ResetOrder),
             title: "Reset tile order?",
@@ -1919,6 +2305,105 @@ fn own_pages() -> Vec<OwnPage> {
             ],
         },
     ]
+}
+
+/// The tiles of the main row: the configured ones, then the services that were added.
+fn main_entries(config: &Config, shown: &tiles::Shown) -> Vec<Entry> {
+    let names: Vec<&str> = config.tiles.iter().map(|tile| tile.name.as_str()).collect();
+    tiles::listed(tiles::MAIN, &names, shown)
+        .into_iter()
+        .map(|(item, _)| match item {
+            tiles::Item::Configured(index) => Entry::from(&config.tiles[index]),
+            tiles::Item::Catalog(app) => catalog_entry(app),
+        })
+        .collect()
+}
+
+fn submenu_entries(config: &Config) -> BTreeMap<String, Vec<Entry>> {
+    config
+        .submenus
+        .iter()
+        .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
+        .collect()
+}
+
+fn catalog_entry(app: &'static catalog::App) -> Entry {
+    Entry {
+        name: app.name.to_owned(),
+        icon: Some(app.icon()),
+        description: Some(app.description.to_owned()),
+        command: Command::Web(app),
+    }
+}
+
+/// The pages tiles can be taken off, main row first: the page's key, what it is called
+/// ("Put back on ..."), and its configured tiles, with the icon each shows.
+fn configured_pages(config: &Config) -> Vec<(String, String, Vec<Entry>)> {
+    let entries = |tiles: &[Tile]| -> Vec<Entry> {
+        tiles
+            .iter()
+            .map(|tile| Entry {
+                icon: resolved_icon(tile),
+                ..Entry::from(tile)
+            })
+            .collect()
+    };
+    let main = (
+        Page::Main.key(),
+        "the main row".to_owned(),
+        entries(&config.tiles),
+    );
+    let submenus = config.submenus.iter().map(|(name, tiles)| {
+        (
+            Page::Submenu(name.clone()).key(),
+            name.clone(),
+            entries(tiles),
+        )
+    });
+    std::iter::once(main).chain(submenus).collect()
+}
+
+/// The icon a configured tile shows, as a name or path, for a copy of the tile that has
+/// another command: the one it was given, else its application's.
+fn resolved_icon(tile: &Tile) -> Option<String> {
+    if let Some(icon) = &tile.icon {
+        return Some(icon.clone());
+    }
+    match &tile.action {
+        Action::Desktop(id) => {
+            let icon = gio_unix::DesktopAppInfo::new(id)?.icon()?;
+            match icon.downcast::<gio::ThemedIcon>() {
+                Ok(themed) => themed.names().first().map(|name| name.to_string()),
+                Err(icon) => gio::prelude::IconExt::to_string(&icon).map(|name| name.to_string()),
+            }
+        }
+        Action::Flatpak(id) => Some(id.clone()),
+        _ => None,
+    }
+}
+
+/// What an empty page says instead of a selected tile's name and description.
+fn empty_page_text(page: &Page) -> Option<(&'static str, &'static str)> {
+    match page {
+        Page::Main => Some(("No tiles yet", "Press + to add some")),
+        Page::Submenu(_) => Some(("No tiles here", "Put them back with + on the main row")),
+        Page::Add => Some(("Everything is already on the launcher", "")),
+        _ => None,
+    }
+}
+
+/// Top-right, left of the power button: the way into the Add page.
+fn plus_button() -> gtk::Button {
+    let icon = gtk::Image::from_icon_name("list-add-symbolic");
+    icon.set_pixel_size(32);
+    let button = gtk::Button::builder()
+        .child(&icon)
+        .css_classes(["power-button"])
+        .valign(gtk::Align::Start)
+        .margin_top(8)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("Add a tile")]);
+    button
 }
 
 /// Top-right, next to the clock: the way into the power menu.
@@ -2039,16 +2524,17 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_back, is_enter, is_navigation, order_listing, own_pages, row_layout, CloseQueue,
-        Command, Confirmable, Page, Request, TILE_MAX, TILE_MIN, TILE_MIN_SPACING, TILE_SPACING,
+        is_back, is_enter, is_navigation, order_listing, own_pages, CloseQueue, Command,
+        Confirmable, Page, Request,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
 
-    const ALL_CONFIRMABLE: [Confirmable; 3] = [
+    const ALL_CONFIRMABLE: [Confirmable; 4] = [
         Confirmable::Shutdown,
         Confirmable::Restart,
         Confirmable::ResetOrder,
+        Confirmable::RemoveTile,
     ];
 
     #[test]
@@ -2080,58 +2566,6 @@ mod tests {
             assert!(!is_enter(key));
         }
         assert!(!is_enter(Key::HomePage) && !is_back(Key::HomePage));
-    }
-
-    // The row of any number of tiles fits between the page margins.
-    #[test]
-    fn a_row_of_any_length_fits_the_screen() {
-        for width in [1280, 1366, 1920, 3840] {
-            for count in 1..=30 {
-                let (size, spacing) = row_layout(width, count);
-                let count = count as i32;
-                let row = count * size + (count - 1) * spacing;
-                assert!(row <= width - 2 * 96, "{count} tiles at {width}: {row} px");
-            }
-        }
-    }
-
-    #[test]
-    fn tiles_keep_full_size_on_a_wide_screen() {
-        for width in [1600, 1920, 3840] {
-            assert_eq!(row_layout(width, 6), (TILE_MAX, TILE_SPACING), "{width}");
-        }
-    }
-
-    #[test]
-    fn tiles_shrink_so_the_row_fits_a_small_screen() {
-        for width in [1280, 1366, 1440] {
-            let (size, spacing) = row_layout(width, 6);
-            assert!(size < TILE_MAX, "{width}: tiles shrink");
-            assert_eq!(spacing, TILE_SPACING, "{width}: the gaps are kept");
-        }
-    }
-
-    // Past the point where tiles of the minimum size fit with the full gaps, the gaps
-    // close up before the tiles shrink further.
-    #[test]
-    fn a_long_row_closes_the_gaps_before_shrinking_the_tiles() {
-        let (size, spacing) = row_layout(1920, 14);
-        assert_eq!(size, TILE_MIN);
-        assert!(
-            (TILE_MIN_SPACING..TILE_SPACING).contains(&spacing),
-            "{spacing}"
-        );
-
-        let (size, spacing) = row_layout(1920, 30);
-        assert!(size < TILE_MIN, "{size}");
-        assert_eq!(spacing, TILE_MIN_SPACING);
-    }
-
-    #[test]
-    fn a_row_layout_never_divides_by_zero_or_vanishes() {
-        assert_eq!(row_layout(1920, 0), (TILE_MAX, TILE_SPACING));
-        assert!(row_layout(100, 6).0 >= 1);
-        assert!(row_layout(0, 1).0 >= 1);
     }
 
     #[test]
@@ -2166,6 +2600,7 @@ mod tests {
             Confirmable::Shutdown => Command::Config(Action::Builtin(Builtin::Shutdown)),
             Confirmable::Restart => Command::Config(Action::Builtin(Builtin::Restart)),
             Confirmable::ResetOrder => Command::ResetOrder,
+            Confirmable::RemoveTile => Command::Remove,
         }
     }
 
@@ -2192,6 +2627,18 @@ mod tests {
             (config(Action::Builtin(Builtin::Shutdown)), true),
             (config(Action::Builtin(Builtin::Restart)), true),
             (Command::ResetOrder, true),
+            (Command::Remove, true),
+            (Command::Move, false),
+            (
+                Command::Web(crate::catalog::find("netflix").unwrap()),
+                false,
+            ),
+            (
+                Command::Add(crate::tiles::Addable::Catalog(
+                    crate::catalog::find("netflix").unwrap(),
+                )),
+                false,
+            ),
             (config(Action::Builtin(Builtin::DesktopMode)), false),
             (config(Action::Command("mpv".into())), false),
             (config(Action::Desktop("a.desktop".into())), false),
@@ -2223,12 +2670,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            order_listing(&config, &saved),
+            order_listing(&config, &saved, &crate::tiles::Shown::default()),
             "main:\n  1. B\n  2. A\n  3. Games\n  4. New\nsubmenu Games:\n  1. Y\n  2. X\n"
         );
         // With nothing saved, the configured order.
         assert_eq!(
-            order_listing(&config, &crate::order::Saved::new()),
+            order_listing(
+                &config,
+                &crate::order::Saved::new(),
+                &crate::tiles::Shown::default()
+            ),
             "main:\n  1. A\n  2. B\n  3. Games\n  4. New\nsubmenu Games:\n  1. X\n  2. Y\n"
         );
     }
@@ -2238,15 +2689,8 @@ mod tests {
     #[test]
     fn the_launcher_has_one_page_of_its_own_for_each_of_its_pages() {
         let pages: Vec<_> = own_pages().into_iter().map(|own| own.page).collect();
-        let mut expected = vec![Page::Power];
-        expected.extend(
-            [
-                Confirmable::Shutdown,
-                Confirmable::Restart,
-                Confirmable::ResetOrder,
-            ]
-            .map(Page::Confirm),
-        );
+        let mut expected = vec![Page::Power, Page::TileOptions];
+        expected.extend(ALL_CONFIRMABLE.map(Page::Confirm));
         for page in &expected {
             assert_eq!(pages.iter().filter(|p| *p == page).count(), 1, "{page:?}");
         }
@@ -2268,11 +2712,20 @@ mod tests {
             Page::Confirm(Confirmable::ResetOrder).key(),
             "confirm:reset"
         );
+        // The pages that came with adding and removing tiles.
+        assert_eq!(Page::Add.key(), "add");
+        assert_eq!(Page::TileOptions.key(), "options");
+        assert_eq!(
+            Page::Confirm(Confirmable::RemoveTile).key(),
+            "confirm:remove"
+        );
+        // The main row's key is the one `tiles.json` names it by.
+        assert_eq!(Page::Main.key(), crate::tiles::MAIN);
     }
 
     #[test]
     fn a_page_is_found_again_from_its_key() {
-        let mut pages = vec![Page::Main, Page::Power];
+        let mut pages = vec![Page::Main, Page::Power, Page::Add, Page::TileOptions];
         // Submenu names are the user's, whatever they hold.
         for name in [
             "Games",
@@ -2285,14 +2738,7 @@ mod tests {
         ] {
             pages.push(Page::Submenu(name.to_owned()));
         }
-        pages.extend(
-            [
-                Confirmable::Shutdown,
-                Confirmable::Restart,
-                Confirmable::ResetOrder,
-            ]
-            .map(Page::Confirm),
-        );
+        pages.extend(ALL_CONFIRMABLE.map(Page::Confirm));
         for page in pages {
             assert_eq!(Page::from_key(&page.key()), Some(page.clone()), "{page:?}");
         }
@@ -2313,6 +2759,56 @@ mod tests {
         assert_eq!(crate::order::arrange(&["A", "B", "Games"], main), [1, 0, 2]);
         let games = saved.get(&Page::Submenu("Games".into()).key());
         assert_eq!(crate::order::arrange(&["X", "Y"], games), [1, 0]);
+    }
+
+    #[test]
+    fn the_options_page_offers_cancel_first_then_move_and_remove() {
+        let pages = own_pages();
+        let options = pages
+            .iter()
+            .find(|own| own.page == Page::TileOptions)
+            .unwrap();
+        let commands: Vec<_> = options.tiles.iter().map(|tile| &tile.command).collect();
+        assert_eq!(
+            commands,
+            [&Command::Cancel, &Command::Move, &Command::Remove]
+        );
+    }
+
+    // `--print-order` shows what the screen shows: added services last (or where the
+    // order put them), removed tiles gone.
+    #[test]
+    fn the_listing_has_the_added_services_and_not_the_removed_tiles() {
+        let config = crate::config::Config::parse(
+            r#"{ "tiles": [
+                    { "name": "A", "icon": "a", "command": "a" },
+                    { "name": "B", "icon": "b", "command": "b" },
+                    { "name": "C", "icon": "c", "command": "c" } ] }"#,
+        )
+        .unwrap();
+        let shown: crate::tiles::Shown = serde_json::from_str(
+            r#"{ "added": ["netflix", "hulu"], "hidden": { "main": [["B", 0]] } }"#,
+        )
+        .unwrap();
+        let saved: crate::order::Saved =
+            serde_json::from_str(r#"{ "main": [["Hulu", 0], ["A", 0]] }"#).unwrap();
+        assert_eq!(
+            order_listing(&config, &saved, &shown),
+            "main:\n  1. Hulu\n  2. A\n  3. C\n  4. Netflix\n"
+        );
+    }
+
+    // A tile asks for a catalog service by the name the Add page lists it under.
+    #[test]
+    fn a_catalog_service_has_a_tile_that_opens_it_with_its_own_icon() {
+        let config = crate::config::Config::default();
+        let shown: crate::tiles::Shown =
+            serde_json::from_str(r#"{ "added": ["netflix"] }"#).unwrap();
+        let entries = super::main_entries(&config, &shown);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Netflix");
+        assert_eq!(entries[0].icon.as_deref(), Some("vextheater-netflix"));
+        assert!(matches!(entries[0].command, Command::Web(app) if app.id == "netflix"));
     }
 
     // A reload waits while a close runs, so the queue says whether one does.

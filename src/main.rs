@@ -1,15 +1,19 @@
 //! VexTheater — a full-screen TV launcher for GNOME.
 
+mod catalog;
 mod clock;
 mod config;
 mod diagnose;
 mod files;
 mod gnome;
+mod grid;
 mod keybinding;
 mod launch;
 mod mode;
 mod order;
 mod sound;
+mod tiles;
+mod webapp;
 mod widgets;
 mod window;
 
@@ -105,7 +109,8 @@ fn print_order(extra: &[String]) -> i32 {
     }
     match config::Config::load_default() {
         Ok(config) => {
-            print!("{}", window::order_listing(&config, &order::load()));
+            let listing = window::order_listing(&config, &order::load(), &tiles::Shown::load());
+            print!("{listing}");
             0
         }
         Err(error) => {

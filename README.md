@@ -34,6 +34,7 @@ programs.vextheater = {
   "title": "VexOS Theater",
   "homeKey": "F10",
   "background": "/path/to/wallpaper.jpg",
+  "browser": "/run/current-system/sw/bin/brave",
   "tiles": [
     { "name": "YouTube", "icon": "/path/to/youtube.svg", "description": "YouTube TV interface, full screen",
       "command": "brave --kiosk --app=https://youtube.com/tv" },
@@ -62,7 +63,9 @@ the contract with vexos-nix: **a new configuration key has to land in VexTheater
 vexos-nix starts sending it**, because strict parsing, and the check the NixOS module
 runs while building (see `--check-config` below), would otherwise reject it.
 
-A configuration with no tiles shows "No tiles configured" and the power button.
+A configuration with no tiles shows "No tiles yet, press + to add some", with the + and
+power buttons: tiles can also be added from the launcher itself (see "Arranging, adding
+and removing tiles" below).
 
 A `desktop` tile whose desktop file is not installed, and a `flatpak` tile whose app is
 not (its exported desktop file is not found, and it has no installation directory in
@@ -71,9 +74,10 @@ installed"; choosing it only shows a message, and the open app is left running. 
 checked when the launcher is built and each time it is shown again. `command` tiles are
 not checked.
 
-Tiles shrink from 200 px to fit the row on a narrow screen. A long row then closes up
-the gaps between tiles before shrinking the tiles below 100 px (past about 15 tiles on a
-1920 px screen), so a row of any length stays on screen.
+Tiles are 200 px, as many to a row as fit the screen's width. More tiles wrap onto further
+rows below, and the tiles shrink (so more fit in a row, with the gaps closing up too) only
+when the rows would be too tall for the screen. The page never scrolls and nothing goes
+off screen, however many tiles there are.
 
 `vextheater --check-config [FILE]` checks a configuration file (by default the one the
 launcher would read) without a display. It exits 0 for a good file, or 1 after printing
@@ -87,8 +91,9 @@ again; so do `vextheater` and `vextheater --home`.
 ### Power menu
 
 The round power button beside the clock is part of the launcher, not of the
-configuration: press Up from the tile row to select it (Down goes back to the tiles) and
-Enter, or click it, to open the power menu with Desktop Mode, Restart and Shutdown. Esc
+configuration: press Up from the top tile row to select the + button, Right to select
+this one (Down goes back to the tiles) and Enter, or click it, to open the power menu
+with Desktop Mode, Restart and Shutdown. Esc
 leaves the menu. Restart, Shutdown and Reset Tile Order (below) ask for confirmation
 first, with Cancel selected, so a stray key press cannot power the machine off. Tiles with a `shutdown` or `restart` builtin in a submenu of the
 configuration ask the same way.
@@ -96,20 +101,52 @@ configuration ask the same way.
 A TV remote's keys work too, when its receiver reports them as such: Back like Esc,
 Select or OK like Enter, and Home returns to the tile row.
 
-### Arranging tiles
+### Arranging, adding and removing tiles
 
-The tiles of the main row and of the configured submenus can be reordered from the
-launcher (the power menu cannot). Pick a tile up by holding Enter on it, or pressing Menu
-or F2. A picked-up tile is lifted and ringed, ← → move it one place (it stops at the ends),
-Enter drops it, and Back cancels and puts it back. After a drop, the selection stays on
-the tile.
+Every tile of the main row and of the configured submenus has options, whether it comes
+from the configuration or was added from the launcher: **Move** and **Remove**. Open them
+with Menu or F2 on the tile, by holding Enter on it, or with a right click. The options
+page is named after the tile and has Cancel (selected first), Move and Remove. The power
+menu, the Add page and the confirmations have none.
+
+- **Move** picks the tile up: it is lifted and ringed, ← → move it one place (on to the
+  next or the previous row at a row's end), ↑ ↓ move it one row, and it stops at the ends.
+  Enter, Menu or F2 drops it, and Back cancels and puts it back. After a drop, the
+  selection stays on the tile.
+- **Remove** asks first ("Remove Plex?", with Cancel selected). The configuration is never
+  changed: a tile from it is only hidden, and a service of the catalog is forgotten.
+  Either can be put back with +.
+- The **+** button, left of the power button (Up from the top tile row selects it, Left
+  and Right move between it and the power button), opens "Add a tile": first the tiles
+  that were removed ("Put back on the main row", or on the submenu they were in), then
+  the services of the catalog (below) that are not on the launcher. Choosing one puts it
+  on the launcher and selects it. A service goes last on the main row, and can be moved
+  like any tile; a tile put back returns to the place the saved order had it in. With
+  nothing to add, the page says "Everything is already on the launcher".
 
 Holding Back for two seconds on the main row asks to reset the tile order to the
-configured one, after confirmation (Cancel is selected first).
+configured one, after confirmation (Cancel is selected first). It resets the order only,
+not what was added or removed.
 
-A remote that cannot hold a key cannot do either: the HDMI-CEC bridge in vexos-nix
-presses and releases at once, and sends no Menu or F2. Use a keyboard, or a USB or
-Bluetooth remote, to arrange or reset.
+A remote that cannot hold a key cannot open the options by holding Enter: the HDMI-CEC
+bridge in vexos-nix presses and releases at once, and sends no Menu or F2. Until it maps
+a button to Menu, use a keyboard, a USB or Bluetooth remote, or the pointer's right
+click for the options and the reset. The + button needs only Up and Enter.
+
+What was added and removed is saved in `$XDG_STATE_HOME/vextheater/tiles.json`
+(`~/.local/state/vextheater/`), beside the order:
+
+```json
+{ "added": ["netflix", "disney-plus"],
+  "hidden": { "main": [["Plex", 0]], "submenu:Games": [["Doom", 0]] } }
+```
+
+`added` holds the ids of catalog services (on the main row); `hidden` the configured
+tiles that were removed, by page, in the identity the order uses (name, and place among
+tiles of that name). A configuration change still shows: a tile added to it appears, and
+an id or identity that matches nothing is ignored. A service whose name a configured
+tile of the main row has is neither offered nor shown twice, so the configuration wins.
+A file that cannot be read is ignored, as the order file is.
 
 The order is saved per page in `$XDG_STATE_HOME/vextheater/order.json`
 (`~/.local/state/vextheater/`), on top of the configuration: a tile added to the
@@ -121,8 +158,9 @@ configuration shifts the later ones. Resetting the order deletes the file and re
 row to the configured order; if the file cannot be deleted, it says so and changes
 nothing, since the order would come back at the next start. `vextheater --print-order`
 prints the tiles of each page in the order the launcher shows them (the saved
-arrangement over the configured order, without a display), to see what the file does or
-that a configuration change moved a tile.
+arrangement over the configured order, with the services added and without the tiles
+removed, and without a display), to see what the files do or that a configuration change
+moved a tile.
 
 **Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
 vexos-nix HTPC module sent them). The button replaces them, so the launcher leaves out of
@@ -134,7 +172,36 @@ so `--check-config` sees what the launcher uses.
 
 All top-level keys are optional. `title` is shown under the greeting, `homeKey` names
 the key that closes the open app in the key hints, and without `background` the
-launcher uses a plain dark gradient.
+launcher uses a plain dark gradient. `browser` is the browser that opens the services of
+the catalog.
+
+### The service catalog
+
+VexTheater has a built-in list of streaming services that can be added from + (above):
+Netflix, Disney+, Hulu, HBO Max, Peacock, Paramount+, Prime Video, Apple TV, YouTube (its
+TV interface, which a smart-TV user agent makes the site serve), YouTube TV and
+Crunchyroll. The configuration does not send them; add its own tiles for anything else.
+
+A service opens as a web app: a kiosk window of the browser, `--kiosk --app=<url>`, with
+a profile of its own in `~/.local/share/vextheater/webapps/<id>`, so a login lasts and no
+running instance can swallow another's user agent. Like any app it runs in its own
+systemd scope, so the home key closes it. Before the start the launcher removes a
+`SingletonLock` left by another host (Brave exits with no window after a hostname
+change), and a new profile gets Brave's Widevine opt-in so DRM video plays at once. This
+is what vexos-nix's `mkWebApp` does, which uses a different profile directory: a login
+there has to be made again here.
+
+`browser` is a path or a program name, run without a shell. Without it the first of
+`brave-origin`, `brave`, `brave-browser`, `google-chrome-stable` and `chromium` on `PATH`
+is used. **Use Brave:** Chromium has no Widevine, so the DRM services do not play in it.
+With no browser found the services' tiles are dimmed and say "Not installed", as a missing
+desktop file does. Some services limit the resolution on Linux, or refuse the browser.
+
+The logos are not in this repository. The package fetches them when it is built, pinned
+to a commit, from selfh.st's icon collection (CC BY 4.0) and homarr-labs' dashboard-icons
+(Apache-2.0), as `vextheater-<id>` icons; they are the services' trademarks. A development
+run (`cargo run`) has no logos and shows a placeholder icon. Pluto TV and Tubi are not
+offered because neither collection has their logos.
 
 ## Behaviour
 
@@ -323,6 +390,16 @@ pointing here.
 ## Verify on the device
 
 These depend on the real desktop, so they can only be checked on the machine:
+
+- **The service catalog.** Add each service from + and open it. It must play DRM video
+  in Brave (Widevine L3); note any that cap the resolution or refuse the browser. Home
+  must close the browser window, and opening it again must find the login.
+- **Options and + with the remote.** + works with Up and Enter. The tile options need
+  Menu or F2, or a held Enter, or a right click, which the HDMI-CEC bridge does not send
+  (see "Arranging, adding and removing tiles"); find the CEC code of a spare button with
+  `cec-client` and map it to `KEY_MENU` (139) in vexos-nix.
+- **The right click** opens the options of the tile under the pointer. It is only
+  checked by hand: the launcher's own tests cannot send a pointer click.
 
 - **Home from desktop mode.** In desktop mode, press the home key (the shortcut the
   launcher registers for `homeKey`; see "The home key"), also over a running app. GNOME

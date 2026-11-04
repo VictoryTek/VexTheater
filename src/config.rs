@@ -23,6 +23,10 @@ pub struct Config {
     /// Wallpaper behind the tiles; a plain dark background when unset.
     #[serde(default)]
     pub background: Option<PathBuf>,
+    /// The browser that opens the catalog's web apps: a path or a program name, run
+    /// without a shell. When unset, the first of a list of known browsers on `PATH`.
+    #[serde(default)]
+    pub browser: Option<String>,
     /// The main row, left to right.
     #[serde(default)]
     pub tiles: Vec<Tile>,
@@ -223,7 +227,14 @@ const ACTIONS: [&str; 5] = ["command", "desktop", "flatpak", "submenu", "builtin
 const BUILTINS: [&str; 3] = ["desktop-mode", "shutdown", "restart"];
 
 /// The keys of the configuration.
-const KEYS: [&str; 5] = ["title", "homeKey", "background", "tiles", "submenus"];
+const KEYS: [&str; 6] = [
+    "title",
+    "homeKey",
+    "background",
+    "browser",
+    "tiles",
+    "submenus",
+];
 
 /// The keys of a tile besides its action.
 const TILE_KEYS: [&str; 3] = ["name", "icon", "description"];
@@ -242,7 +253,7 @@ fn locate(text: &str) -> Option<String> {
             KEYS.join(", ")
         ));
     }
-    for key in ["title", "homeKey", "background"] {
+    for key in ["title", "homeKey", "background", "browser"] {
         if root
             .get(key)
             .is_some_and(|v| !v.is_null() && !v.is_string())
@@ -676,6 +687,22 @@ mod tests {
             );
             assert!(Config::parse(&text).is_ok(), "{builtin}");
         }
+    }
+
+    #[test]
+    fn the_browser_is_optional_and_must_be_a_string() {
+        assert_eq!(Config::parse("{}").unwrap().browser, None);
+        let config = Config::parse(r#"{ "browser": "/run/current-system/sw/bin/brave" }"#).unwrap();
+        assert_eq!(
+            config.browser.as_deref(),
+            Some("/run/current-system/sw/bin/brave")
+        );
+        assert_eq!(problem(r#"{ "browser": 5 }"#), "browser: must be a string");
+        assert!(Config::parse(r#"{ "browser": null }"#).is_ok());
+        // An unknown key is still refused, and the message lists the new one.
+        let message = problem(r#"{ "browsers": "x" }"#);
+        assert!(message.starts_with("browsers: unknown key"), "{message}");
+        assert!(message.contains("browser,"), "{message}");
     }
 
     #[test]

@@ -900,7 +900,7 @@ fn exec_argv(exec: &str) -> anyhow::Result<Vec<String>> {
     Ok(argv)
 }
 
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
