@@ -99,7 +99,8 @@ first, with Cancel selected, so a stray key press cannot power the machine off. 
 configuration ask the same way.
 
 A TV remote's keys work too, when its receiver reports them as such: Back like Esc,
-Select or OK like Enter, and Home returns to the tile row.
+Select or OK like Enter, Home returns to the tile row, and Settings (`XF86Tools`, evdev
+`KEY_CONFIG`) opens the power menu from the main row, like selecting the power button.
 
 ### Arranging, adding and removing tiles
 
@@ -407,10 +408,11 @@ These depend on the real desktop, so they can only be checked on the machine:
   notification, the launcher cannot raise itself from there. Check that GNOME runs the
   shortcut at all: `gsettings get org.gnome.settings-daemon.plugins.media-keys
   custom-keybindings` lists it after the launcher has started.
-- **What the remote sends.** Run `wev` and press the remote's Back, Select (OK) and
-  Home buttons. The launcher takes `XF86Back` as Esc, `XF86Select`, `XF86OK` and the
-  old `Select` as Enter, and `XF86HomePage` as "back to the tile row", on top of the
-  keyboard keys; if the remote reports other key names, they need adding.
+- **What the remote sends.** Run `wev` and press the remote's Back, Select (OK), Home
+  and Settings buttons. The launcher takes `XF86Back` as Esc, `XF86Select`, `XF86OK` and
+  the old `Select` as Enter, `XF86HomePage` as "back to the tile row", and `XF86Tools` as
+  "open the power menu", on top of the keyboard keys; if the remote reports other key
+  names, they need adding.
 - **GNOME leaves Home to the launcher.** If `wev` shows no event for the remote's Home
   button, GNOME grabbed it first, and the button never reaches the launcher. Look for
   the binding with

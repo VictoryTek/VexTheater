@@ -741,6 +741,11 @@ impl Ui {
                     ui.sounds.chosen();
                     glib::Propagation::Stop
                 }
+                // A remote's settings button: the power button, from the main row.
+                key if is_settings(key) && ui.on_main_page() => {
+                    power_button.emit_clicked();
+                    glib::Propagation::Stop
+                }
                 // From the top row only: Up in a lower row moves up a row.
                 gtk::gdk::Key::Up
                     if ui.on_main_page()
@@ -2165,6 +2170,11 @@ fn is_select(key: gtk::gdk::Key) -> bool {
         || glib::translate::IntoGlib::into_glib(key) == XF86_OK
 }
 
+/// The settings button of a remote: evdev `KEY_CONFIG` is `XF86Tools`.
+fn is_settings(key: gtk::gdk::Key) -> bool {
+    key == gtk::gdk::Key::Tools
+}
+
 /// Escape, Backspace, and the back key of a TV remote.
 fn is_back(key: gtk::gdk::Key) -> bool {
     use gtk::gdk::Key;
@@ -2524,8 +2534,8 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_back, is_enter, is_navigation, order_listing, own_pages, CloseQueue, Command,
-        Confirmable, Page, Request,
+        is_back, is_enter, is_navigation, is_settings, order_listing, own_pages, CloseQueue,
+        Command, Confirmable, Page, Request,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -2566,6 +2576,14 @@ mod tests {
             assert!(!is_enter(key));
         }
         assert!(!is_enter(Key::HomePage) && !is_back(Key::HomePage));
+    }
+
+    #[test]
+    fn only_the_tools_key_is_the_settings_button() {
+        assert!(is_settings(Key::Tools));
+        for key in [Key::Menu, Key::F2, Key::F10, Key::HomePage, Key::Return] {
+            assert!(!is_settings(key));
+        }
     }
 
     #[test]
