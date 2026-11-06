@@ -11,7 +11,7 @@ use crate::keybinding;
 use crate::mode::{self, Mode};
 use crate::sound::Sounds;
 use crate::tiles::{self, Addable};
-use crate::widgets::{hint, label};
+use crate::widgets::{hint, key_label, label};
 use crate::{launch, order, webapp};
 use adw::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -1575,7 +1575,7 @@ impl Ui {
                 hints.append(&hint("Enter", "Open"));
             }
             if let Some(key) = &self.config.borrow().home_key {
-                hints.append(&hint(key, "Home (closes the open app)"));
+                hints.append(&hint(&key_label(key), "Home (closes the open app)"));
             }
         }
         hints
