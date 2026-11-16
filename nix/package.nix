@@ -31,6 +31,7 @@ let
     "youtube" = { url = selfhst "youtube"; hash = "sha256-iKHp5Eg3VRwF1uiClmSSGmm6T2zIariL9kkB3cHz538="; };
     "youtube-tv" = { url = homarr "youtube-tv"; hash = "sha256-Bf8mTwOGkijP6KuZS8dPhO8V4SBUidYbBgSkX9F4sEU="; };
     "crunchyroll" = { url = selfhst "crunchyroll"; hash = "sha256-lr8Se0zuJ2xf3UtL7ee4qby8Ou1jaaS6UuhKJZ6ijA4="; };
+    "jellyfin" = { url = selfhst "jellyfin"; hash = "sha256-m/uHU9mDEDiJqNwkhzi/0FbgP1JzTi1u60pcWSUUjBA="; };
   };
   installCatalogLogos = lib.concatStringsSep "\n" (lib.mapAttrsToList
     (id: logo: ''

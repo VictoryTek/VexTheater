@@ -123,7 +123,8 @@ menu, the Add page and the confirmations have none.
   the services of the catalog (below) that are not on the launcher. Choosing one puts it
   on the launcher and selects it. A service goes last on the main row, and can be moved
   like any tile; a tile put back returns to the place the saved order had it in. With
-  nothing to add, the page says "Everything is already on the launcher".
+  nothing to add, the page holds only "Setup & health" (see Troubleshooting), which is
+  always its last tile.
 
 Holding Back for two seconds on the main row asks to reset the tile order to the
 configured one, after confirmation (Cancel is selected first). It resets the order only,
@@ -180,8 +181,14 @@ the catalog.
 
 VexTheater has a built-in list of streaming services that can be added from + (above):
 Netflix, Disney+, Hulu, HBO Max, Peacock, Paramount+, Prime Video, Apple TV, YouTube (its
-TV interface, which a smart-TV user agent makes the site serve), YouTube TV and
-Crunchyroll. The configuration does not send them; add its own tiles for anything else.
+TV interface, which a smart-TV user agent makes the site serve), YouTube TV, Crunchyroll
+and Jellyfin. The configuration does not send them; add its own tiles for anything else.
+
+Jellyfin is the exception to what follows: it is self-hosted, so it opens the native
+Jellyfin Desktop client (the Flatpak `org.jellyfin.JellyfinDesktop`, the new name of
+Jellyfin Media Player) instead of a web app, which asks for your server on its first
+start. Install the Flatpak first; until then its tile says "isn't installed". It needs no
+browser, and, being a Flatpak, closes with the home key like any other Flatpak tile.
 
 A service opens as a web app: a kiosk window of the browser, `--kiosk --app=<url>`, with
 a profile of its own in `~/.local/share/vextheater/webapps/<id>`, so a login lasts and no
@@ -223,7 +230,10 @@ offered because neither collection has their logos.
   shutting down. Only one close runs at a time: tiles chosen (or home pressed) during
   a close replace each other, and only the last one is acted on when it finishes.
   Choosing Desktop Mode during a close replaces a pending tile, and the launcher hides
-  once the previous app is gone, so it is not uncovered while closing.
+  once the previous app is gone, so it is not uncovered while closing. A close that
+  takes more than a moment shows "Closing the open app, then opening …" with a spinner;
+  Back gives up the pending tile (the close goes on, and the launcher stays), and a
+  configuration that changed meanwhile is applied once the close ends at the launcher.
   `vextheater --home` closes the app and shows the launcher again (see "The home key"
   below for the shortcut). Both close every
   `vextheater-app-*` scope and recorded Flatpak instance, including apps left running
@@ -301,13 +311,19 @@ offered because neither collection has their logos.
   and put back on desktop mode, quitting, closing the window (Alt+F4), SIGTERM and
   SIGINT. A launcher restarted after a crash keeps the saved file, so the original
   values still come back. State files are written atomically: a temporary file, synced
-  and renamed over the old one, then the directory synced.
+  and renamed over the old one, then the directory synced. The saved file is deleted
+  only once every value is back: one that could not be put back stays in it for the
+  next try, and a file that cannot be read is kept (a launcher that finds one sets it
+  aside as `gnome-settings.json.unreadable`). A file from an older launcher gets the
+  Super key's value added before that is turned off.
 - An app that exits with an error within 5 s of starting (not installed, command not
   found), or a refused shutdown or restart, shows "Couldn't open …".
 - A `desktop` tile's Exec line is parsed by the Desktop Entry spec's rules (quoted
   arguments keep their spaces, `\"` `` \` `` `\$` `\` are unescaped inside double
   quotes, `%%` is `%`, the file and URL field codes are dropped) and each argument is
-  quoted for `sh`.
+  quoted for `sh`. `%c` is the app's name and `%k` its desktop file's path, each one
+  argument however many spaces it holds; `%i` is `--icon` and the icon, or nothing when
+  the entry has no icon.
 - An app that hands its window to an instance that is already running and then exits
   (Nautilus when it is already open, or Brave left open in desktop mode) lives outside
   the launcher's control: home cannot close it, and the launcher comes back in front
@@ -377,11 +393,20 @@ and `gsettings reset` puts the Super key back to GNOME's default.)
 session and prints one `ok` or `FAIL` line per check, exiting 1 if any failed. It runs
 in the launcher's own environment, which for the autostart service is not a shell's:
 GNOME's settings schemas (and `XDG_DATA_DIRS`, where GLib looks for them),
-`systemd-run --user` and `systemctl --user`, `flatpak` on the `PATH` when a tile starts
-a Flatpak app, and the background and icon files named in the configuration. The
-launcher stays busy for the moments this takes, up to 5 s per helper command. When
-theater mode finds its GNOME schemas missing, the launcher also logs one warning
-pointing here.
+`systemd-run --user` and `systemctl --user`, the browser (the configured one must be
+there; with none configured, one of the known browsers must be on the `PATH` once a web
+service is on the launcher), the Home key shortcut (compared with the configuration,
+never rewritten by a check), `flatpak` on the `PATH` when a tile starts a Flatpak app,
+the desktop and Flatpak apps the tiles start, and the background and icon files named
+in the configuration. The helper commands get 5 s each; one that hangs is killed. They
+run without blocking the launcher, so it stays usable meanwhile. When theater mode finds
+its GNOME schemas missing, the launcher also logs one warning pointing here.
+
+The same checks are on screen as **Setup & health**, the last tile of the + page, so a
+remote is enough to read them: "Check again" first, with how the last run went, then a
+tile per check with what it found or why it failed, the failures first. Choosing "Check
+again" runs them again, which is how a fixed problem turns up as fixed. Back leaves the
+page at any time, even while the checks run.
 
 - The hot corner, Super key or banners never turn off: the launcher finds GNOME's settings
   schemas through `XDG_DATA_DIRS`, and if `systemctl --user show-environment` shows it

@@ -12,10 +12,14 @@ pub struct App {
     pub id: &'static str,
     /// The tile's name. A configured main-row tile with this name hides the entry.
     pub name: &'static str,
+    /// The site a web app opens; empty for a Flatpak service.
     pub url: &'static str,
     pub description: &'static str,
     /// Whether the site is shown its TV interface, which needs a smart-TV user agent.
     pub tv_user_agent: bool,
+    /// The Flatpak application id of a service that is a native app, which opens in
+    /// place of a web app. Such a service has to be installed.
+    pub flatpak: Option<&'static str>,
 }
 
 impl App {
@@ -39,6 +43,7 @@ const fn app(
         url,
         description,
         tv_user_agent: false,
+        flatpak: None,
     }
 }
 
@@ -113,6 +118,12 @@ pub const APPS: &[App] = &[
         "https://www.crunchyroll.com",
         "Anime",
     ),
+    // Self-hosted, so there is no URL to open: the native client asks for the server on
+    // its first start.
+    App {
+        flatpak: Some("org.jellyfin.JellyfinDesktop"),
+        ..app("jellyfin", "Jellyfin", "", "Your own media server")
+    },
 ];
 
 /// The service with this id, if the catalog has one. A saved id that no longer matches
@@ -150,10 +161,24 @@ mod tests {
     }
 
     #[test]
-    fn urls_are_https() {
+    fn web_services_have_an_https_url_and_flatpak_services_none() {
         for app in APPS {
-            assert!(app.url.starts_with("https://"), "{}", app.id);
+            match app.flatpak {
+                Some(id) => {
+                    assert!(app.url.is_empty() && !app.tv_user_agent, "{}", app.id);
+                    assert!(!id.is_empty() && !id.contains('/'), "{}", app.id);
+                }
+                None => assert!(app.url.starts_with("https://"), "{}", app.id),
+            }
         }
+    }
+
+    #[test]
+    fn jellyfin_is_the_native_client() {
+        assert_eq!(
+            find("jellyfin").and_then(|app| app.flatpak),
+            Some("org.jellyfin.JellyfinDesktop")
+        );
     }
 
     #[test]

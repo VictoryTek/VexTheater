@@ -118,7 +118,7 @@ fn start_with(action: &Action, env: &Env) -> anyhow::Result<Running> {
             let exec = info
                 .commandline()
                 .with_context(|| format!("{id} has no Exec line"))?;
-            let command = desktop_command(&exec.to_string_lossy())?;
+            let command = desktop_command(&exec.to_string_lossy(), &EntryFields::of(&info))?;
             match info.string("X-Flatpak") {
                 Some(app) => start_flatpak(&app, &command, env),
                 None => start_in_scope(&command, env),
@@ -313,7 +313,14 @@ async fn stop_all_with(launched: Option<Running>, env: Rc<Env>) -> Result<(), St
             Ok((_, FlatpakOutcome::Closed)) => {}
             Ok((record, FlatpakOutcome::Stuck)) => still_running.push(record),
             Ok((record, FlatpakOutcome::GaveUp)) => gave_up.push(record.app),
-            Err(_) => still_running.push(original),
+            // A task that did not finish may have SIGTERMed the app: what it recorded
+            // beforehand, not the record it started with, is what stays.
+            Err(_) => {
+                let durable = load_flatpaks(&env.records)
+                    .into_iter()
+                    .find(|saved| saved.same_process(&original));
+                still_running.push(durable.unwrap_or(original));
+            }
         }
     }
     save_flatpaks(&env.records, &still_running);
@@ -409,6 +416,21 @@ async fn stop_flatpak(mut record: FlatpakApp, env: Rc<Env>) -> (FlatpakApp, Flat
     };
 
     if !record.termed {
+        // The intent goes to the record file before the signal. A crash between the two
+        // loses the SIGTERM (the app is then only killed, by a later close) instead of
+        // sending a second one to an app that is shutting down cleanly, which would
+        // kill it. No file write plus `kill` is atomic, so one of the two has to be
+        // chosen; this is the one that never costs a session. If the record cannot be
+        // written the close still goes ahead: it was asked for, and the failure is
+        // logged, here and again by the save that ends the close.
+        record.termed = true;
+        if let Err(error) = update_flatpak_record(&env.records, &record) {
+            log::error!(
+                "cannot record that {} is being closed: {error}; a crash now could \
+                 SIGTERM it a second time",
+                record.app
+            );
+        }
         match &ready {
             Some((_, targets)) => {
                 for &pid in targets {
@@ -424,7 +446,6 @@ async fn stop_flatpak(mut record: FlatpakApp, env: Rc<Env>) -> (FlatpakApp, Flat
                 record.signal(libc::SIGTERM);
             }
         }
-        record.termed = true;
     }
     if wait_until_gone(&record, Instant::now() + env.stop_timeout, &env).await {
         return (record, FlatpakOutcome::Closed);
@@ -689,10 +710,26 @@ fn load_flatpaks(file: &Path) -> Vec<FlatpakApp> {
     crate::files::read_json(file, "the recorded Flatpak apps").unwrap_or_default()
 }
 
+fn write_flatpaks(file: &Path, apps: &[FlatpakApp]) -> std::io::Result<()> {
+    crate::files::write_json(file, apps)
+}
+
 fn save_flatpaks(file: &Path, apps: &[FlatpakApp]) {
-    if let Err(error) = crate::files::write_json(file, apps) {
+    if let Err(error) = write_flatpaks(file, apps) {
         log::error!("cannot record the running Flatpak apps: {error}");
     }
+}
+
+/// Replaces the saved record of the same process with `record`, or adds it, leaving the
+/// others as they are. It reads and writes without waiting in between, so the close
+/// tasks, which share the main context's thread, never interleave their updates.
+fn update_flatpak_record(file: &Path, record: &FlatpakApp) -> std::io::Result<()> {
+    let mut apps = load_flatpaks(file);
+    match apps.iter_mut().find(|saved| saved.same_process(record)) {
+        Some(saved) => *saved = record.clone(),
+        None => apps.push(record.clone()),
+    }
+    write_flatpaks(file, &apps)
 }
 
 /// `systemctl stop` returns once the scopes are gone. At the time limit the ones still
@@ -835,69 +872,143 @@ fn scope_argv(systemd_run: &str, unit: &str, command: &str) -> Vec<String> {
     .to_vec()
 }
 
+/// What a desktop entry says about itself, for the field codes that stand for it.
+#[derive(Debug, Default, PartialEq)]
+struct EntryFields {
+    /// The name in the user's language, for `%c`.
+    name: Option<String>,
+    /// The `Icon` key, for `%i`.
+    icon: Option<String>,
+    /// Where the desktop file is, for `%k`.
+    location: Option<String>,
+}
+
+impl EntryFields {
+    fn of(info: &gio_unix::DesktopAppInfo) -> EntryFields {
+        EntryFields {
+            name: Some(info.name().to_string()),
+            icon: info.string("Icon").map(|icon| icon.to_string()),
+            location: info
+                .filename()
+                .map(|path| path.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 /// The shell command that runs a desktop entry's Exec line: its arguments, parsed by
 /// the Desktop Entry spec's rules, each quoted for `sh`.
-fn desktop_command(exec: &str) -> anyhow::Result<String> {
-    let argv = exec_argv(exec)?;
+fn desktop_command(exec: &str, entry: &EntryFields) -> anyhow::Result<String> {
+    let argv = exec_argv(exec, entry)?;
     let quoted: Vec<String> = argv.iter().map(|arg| shell_quote(arg)).collect();
     Ok(format!("exec {}", quoted.join(" ")))
 }
 
-/// Splits an Exec line into arguments (Desktop Entry spec, "The Exec key").
-///
-/// Field codes are expanded first, over the whole line, as GIO does: `%%` becomes `%`
-/// and the codes that stand for files, URLs, the icon or the entry (`%f %F %u %U %i %c
-/// %k`, and the deprecated `%d %D %n %N %v %m`) are dropped, since the launcher passes
-/// none. Then arguments are separated by unquoted spaces; inside double quotes a
-/// backslash escapes `"`, `` ` ``, `$` and `\`. Single quotes have no special meaning.
-fn exec_argv(exec: &str) -> anyhow::Result<Vec<String>> {
-    let mut expanded = String::with_capacity(exec.len());
-    let mut chars = exec.chars().peekable();
-    while let Some(c) = chars.next() {
-        match (c, chars.peek()) {
-            ('%', Some('%')) => {
-                chars.next();
-                expanded.push('%');
-            }
-            ('%', Some(code)) if "fFuUickdDnNvm".contains(*code) => {
-                chars.next();
-            }
-            _ => expanded.push(c),
-        }
-    }
+/// One argument of an Exec line as written: its text with the quoting taken off, and
+/// whether any of it was quoted, which is what makes an empty argument one that counts.
+struct Word {
+    text: String,
+    quoted: bool,
+}
 
-    let mut argv = Vec::new();
-    let mut current: Option<String> = None;
-    let mut chars = expanded.chars();
+/// Splits an Exec line into arguments (Desktop Entry spec, "The Exec key"), then expands
+/// the field codes in each, so a name or path with spaces in it stays one argument.
+///
+/// Arguments are separated by unquoted spaces; inside double quotes a backslash escapes
+/// `"`, `` ` ``, `$` and `\`. Single quotes have no special meaning. Then, per argument:
+/// `%%` becomes `%`, `%c` the name, `%k` the location of the desktop file, and an
+/// argument that is just `%i` the two arguments `--icon` and the icon, or none without
+/// an icon. The codes that stand for files and URLs (`%f %F %u %U`, and the deprecated
+/// `%d %D %n %N %v %m`) are dropped, since the launcher passes none. An unquoted argument
+/// that comes to nothing is left out; a quoted one stays, empty.
+fn exec_argv(exec: &str, entry: &EntryFields) -> anyhow::Result<Vec<String>> {
+    let argv: Vec<String> = split_exec(exec)?
+        .into_iter()
+        .flat_map(|word| expand_word(word, entry))
+        .collect();
+    if argv.is_empty() {
+        bail!("empty Exec line");
+    }
+    Ok(argv)
+}
+
+fn split_exec(exec: &str) -> anyhow::Result<Vec<Word>> {
+    let mut words = Vec::new();
+    let mut current: Option<Word> = None;
+    let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         match c {
-            ' ' | '\t' => argv.extend(current.take()),
+            ' ' | '\t' => words.extend(current.take()),
             '"' => {
-                let arg = current.get_or_insert_with(String::new);
+                let word = current.get_or_insert(Word {
+                    text: String::new(),
+                    quoted: false,
+                });
+                word.quoted = true;
                 loop {
                     match chars.next() {
                         None => bail!("unterminated quote in Exec line: {exec}"),
                         Some('"') => break,
                         Some('\\') => match chars.next() {
-                            Some(escaped @ ('"' | '`' | '$' | '\\')) => arg.push(escaped),
+                            Some(escaped @ ('"' | '`' | '$' | '\\')) => word.text.push(escaped),
                             Some(other) => {
-                                arg.push('\\');
-                                arg.push(other);
+                                word.text.push('\\');
+                                word.text.push(other);
                             }
                             None => bail!("unterminated quote in Exec line: {exec}"),
                         },
-                        Some(other) => arg.push(other),
+                        Some(other) => word.text.push(other),
                     }
                 }
             }
-            other => current.get_or_insert_with(String::new).push(other),
+            other => current
+                .get_or_insert(Word {
+                    text: String::new(),
+                    quoted: false,
+                })
+                .text
+                .push(other),
         }
     }
-    argv.extend(current);
-    if argv.is_empty() {
-        bail!("empty Exec line");
+    words.extend(current);
+    Ok(words)
+}
+
+/// The arguments one word of an Exec line stands for.
+fn expand_word(word: Word, entry: &EntryFields) -> Vec<String> {
+    if !word.quoted && word.text == "%i" {
+        return match entry.icon.as_deref().filter(|icon| !icon.is_empty()) {
+            Some(icon) => vec!["--icon".to_owned(), icon.to_owned()],
+            None => Vec::new(),
+        };
     }
-    Ok(argv)
+    let mut expanded = String::with_capacity(word.text.len());
+    let mut chars = word.text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek().copied()) {
+            ('%', Some('%')) => {
+                chars.next();
+                expanded.push('%');
+            }
+            ('%', Some('c')) => {
+                chars.next();
+                expanded.push_str(entry.name.as_deref().unwrap_or_default());
+            }
+            ('%', Some('k')) => {
+                chars.next();
+                expanded.push_str(entry.location.as_deref().unwrap_or_default());
+            }
+            // `%i` inside a longer argument has no meaning in the spec; it is dropped.
+            ('%', Some(code)) if "fFuUidDnNvm".contains(code) => {
+                chars.next();
+            }
+            _ => expanded.push(c),
+        }
+    }
+    if expanded.is_empty() && !word.quoted {
+        Vec::new()
+    } else {
+        vec![expanded]
+    }
 }
 
 pub(crate) fn shell_quote(word: &str) -> String {
@@ -1042,11 +1153,19 @@ mod tests {
 
     #[test]
     fn splits_exec_lines_by_the_spec() {
-        assert_eq!(exec_argv("firefox %u").unwrap(), ["firefox"]);
-        assert_eq!(exec_argv("app %F --flag").unwrap(), ["app", "--flag"]);
-        assert_eq!(exec_argv("app \"\" x").unwrap(), ["app", "", "x"]);
+        let none = EntryFields::default();
+        assert_eq!(exec_argv("firefox %u", &none).unwrap(), ["firefox"]);
         assert_eq!(
-            exec_argv("/usr/bin/flatpak run --branch=stable io.example.App @@u %U @@").unwrap(),
+            exec_argv("app %F --flag", &none).unwrap(),
+            ["app", "--flag"]
+        );
+        assert_eq!(exec_argv("app \"\" x", &none).unwrap(), ["app", "", "x"]);
+        assert_eq!(
+            exec_argv(
+                "/usr/bin/flatpak run --branch=stable io.example.App @@u %U @@",
+                &none
+            )
+            .unwrap(),
             [
                 "/usr/bin/flatpak",
                 "run",
@@ -1056,7 +1175,74 @@ mod tests {
                 "@@"
             ]
         );
-        assert!(exec_argv("   ").is_err());
+        assert!(exec_argv("   ", &none).is_err());
+        // A line of nothing but codes that are dropped has nothing left to run.
+        assert!(exec_argv("%U %f", &none).is_err());
+    }
+
+    fn entry() -> EntryFields {
+        EntryFields {
+            name: Some("My Cool App".into()),
+            icon: Some("my-cool-app".into()),
+            location: Some("/home/me/my apps/cool.desktop".into()),
+        }
+    }
+
+    // %c and %k stay one argument whatever is in them, quoted or not.
+    #[test]
+    fn the_name_and_the_location_are_each_one_argument() {
+        assert_eq!(
+            exec_argv("app %c %k", &entry()).unwrap(),
+            ["app", "My Cool App", "/home/me/my apps/cool.desktop"]
+        );
+        assert_eq!(
+            exec_argv(r#"app --title="%c" "--from=%k""#, &entry()).unwrap(),
+            [
+                "app",
+                "--title=My Cool App",
+                "--from=/home/me/my apps/cool.desktop"
+            ]
+        );
+        // Without them they are nothing, and an argument that was only them goes.
+        let none = EntryFields::default();
+        assert_eq!(exec_argv("app %c %k x", &none).unwrap(), ["app", "x"]);
+        assert_eq!(exec_argv("app --t=%c", &none).unwrap(), ["app", "--t="]);
+    }
+
+    // %i is two arguments with an icon, none without, and nothing inside another one.
+    #[test]
+    fn the_icon_is_two_arguments_or_none() {
+        assert_eq!(
+            exec_argv("app %i run", &entry()).unwrap(),
+            ["app", "--icon", "my-cool-app", "run"]
+        );
+        let without = EntryFields {
+            icon: None,
+            ..entry()
+        };
+        assert_eq!(exec_argv("app %i run", &without).unwrap(), ["app", "run"]);
+        let empty = EntryFields {
+            icon: Some(String::new()),
+            ..entry()
+        };
+        assert_eq!(exec_argv("app %i run", &empty).unwrap(), ["app", "run"]);
+        assert_eq!(
+            exec_argv("app --icon=%i", &entry()).unwrap(),
+            ["app", "--icon="]
+        );
+    }
+
+    // What a code stands for is never read again as a code, a quote or a space.
+    #[test]
+    fn what_a_code_expands_to_is_not_parsed_again() {
+        let tricky = EntryFields {
+            name: Some(r#"50% "off" %f $HOME"#.into()),
+            ..EntryFields::default()
+        };
+        assert_eq!(
+            exec_argv("app %c", &tricky).unwrap(),
+            ["app", r#"50% "off" %f $HOME"#]
+        );
     }
 
     #[test]
@@ -1095,12 +1281,16 @@ mod exec_tests {
     /// Runs `desktop_command(exec)` through sh with `printf` standing in for the app,
     /// one argument per line in brackets, and returns what it printed.
     fn argv_seen(exec: &str) -> String {
+        argv_seen_for(exec, &EntryFields::default())
+    }
+
+    fn argv_seen_for(exec: &str, entry: &EntryFields) -> String {
         // The lifecycle tests write and then run a stub script. A fork while that
         // script is open for writing leaves the child holding it, and running it then
         // fails with "Text file busy" until the child execs. Waiting for the write to
         // finish first keeps this fork clear of it.
         super::lifecycle_tests::stub_script();
-        let command = desktop_command(exec).unwrap();
+        let command = desktop_command(exec, entry).unwrap();
         let output = std::process::Command::new("sh")
             .args(["-c", &command])
             .output()
@@ -1126,9 +1316,59 @@ mod exec_tests {
         assert_eq!(argv_seen(r#"printf "[%%s]\n" %U 100%% %f"#), "[100%]\n");
     }
 
+    // Through sh, as the launcher runs it: a name and a path with spaces and a quote in
+    // them arrive as single arguments, the icon as two.
+    #[test]
+    fn names_and_paths_with_spaces_reach_the_program_whole() {
+        let entry = EntryFields {
+            name: Some("Bob's \"Big\" App".into()),
+            icon: Some("/icons/big app.svg".into()),
+            location: Some("/home/me/my apps/big.desktop".into()),
+        };
+        assert_eq!(
+            argv_seen_for(r#"printf "[%%s]\n" %i %c %k"#, &entry),
+            "[--icon]\n[/icons/big app.svg]\n[Bob's \"Big\" App]\n[/home/me/my apps/big.desktop]\n"
+        );
+        // Without an icon there is no --icon.
+        let without = EntryFields {
+            icon: None,
+            ..entry
+        };
+        assert_eq!(
+            argv_seen_for(r#"printf "[%%s]\n" %i %c"#, &without),
+            "[Bob's \"Big\" App]\n"
+        );
+    }
+
+    // The fields come from a desktop file as GIO reads it. GIO refuses an entry whose
+    // program it cannot find, hence `sh`.
+    #[test]
+    fn the_fields_are_read_from_a_desktop_file() {
+        let dir = std::env::temp_dir().join(format!("vextheater-desktop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big app.desktop");
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Big App\nIcon=big-app\n\
+             Exec=sh %i %c %k\n",
+        )
+        .unwrap();
+        let info = gio_unix::DesktopAppInfo::from_filename(&path).unwrap();
+        let fields = EntryFields::of(&info);
+        assert_eq!(fields.name.as_deref(), Some("Big App"));
+        assert_eq!(fields.icon.as_deref(), Some("big-app"));
+        assert_eq!(fields.location.as_deref(), path.to_str());
+        let exec = info.commandline().unwrap();
+        assert_eq!(
+            exec_argv(&exec.to_string_lossy(), &fields).unwrap(),
+            ["sh", "--icon", "big-app", "Big App", path.to_str().unwrap()]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn rejects_an_unterminated_quote() {
-        assert!(desktop_command(r#"app "unterminated"#).is_err());
+        assert!(desktop_command(r#"app "unterminated"#, &EntryFields::default()).is_err());
     }
 }
 
@@ -1475,6 +1715,124 @@ done"#;
             assert!(again.is_ok(), "the second close only waits");
         });
         assert_eq!(lab.log("sandbox.log"), "term\nclean\n");
+    }
+
+    /// Ignores SIGTERM like [`STUBBORN`], but logs whether the record file (`$2`) already
+    /// said "being closed" when the signal came, and keeps a copy of the file as it was
+    /// then (`$2.at-signal`).
+    const RECORDING: &str = r#"trap 'if grep -q "\"termed\":true" "$2"; then echo recorded >> "$1"; else echo unrecorded >> "$1"; fi; cp "$2" "$2.at-signal"' TERM
+touch "$1.ready"; while :; do sleep 0.05; done"#;
+
+    // The intent to SIGTERM is durable before the signal is sent, and a launcher that
+    // crashed right after signalling, and restarts from that record, sends no second.
+    #[test]
+    fn the_intent_is_recorded_before_the_sigterm_and_a_restart_sends_no_second() {
+        let lab = Lab::new();
+        let records = lab.path("records.json");
+        let sandbox = lab.spawn(RECORDING, "sandbox.log", &[records.to_str().unwrap()]);
+        let env = lab.env(500);
+        let app = lab.start_flatpak(&env, WATCHER, &[&sandbox.to_string()]);
+        let wrapper = app.flatpak.as_ref().unwrap().pid;
+        lab.write("ps.txt", &listing(wrapper, sandbox));
+
+        let first = block_on(stop_all_with(Some(app), env));
+        assert!(
+            matches!(first, Err(StopError::Timeout)),
+            "it ignores SIGTERM"
+        );
+        assert_eq!(lab.log("sandbox.log"), "recorded\n");
+        let at_signal = load_flatpaks(&lab.path("records.json.at-signal"));
+        assert_eq!(at_signal.len(), 1);
+        assert!(at_signal[0].termed, "{at_signal:?}");
+
+        // The launcher crashed after signalling: all that is left is the record as it
+        // was then. The close that resumes from it must not signal again.
+        std::fs::copy(lab.path("records.json.at-signal"), &records).unwrap();
+        let again = block_on(stop_all_with(None, lab.env(500)));
+        assert!(matches!(again, Err(StopError::Timeout)));
+        assert_eq!(lab.log("sandbox.log"), "recorded\n", "no second SIGTERM");
+    }
+
+    // Closes that run side by side each record their own app, and none loses another's.
+    #[test]
+    fn closing_several_apps_at_once_records_each_without_losing_any() {
+        let lab = Lab::new();
+        let first = lab.spawn(STUBBORN, "first.log", &[]);
+        let second = lab.spawn(STUBBORN, "second.log", &[]);
+        let record = |pid: u32| FlatpakApp {
+            app: APP.into(),
+            pid,
+            start_time: proc_stat(pid).unwrap().start_time,
+            termed: false,
+            kill_attempts: 0,
+        };
+        let env = lab.env(500);
+        save_flatpaks(&env.records, &[record(first), record(second)]);
+        lab.write(
+            "ps.txt",
+            &format!("{}{}", listing(first, first), listing(second, second)),
+        );
+
+        let result = block_on(stop_all_with(None, env));
+        assert!(matches!(result, Err(StopError::Timeout)));
+        assert_eq!(lab.log("first.log"), "term\n");
+        assert_eq!(lab.log("second.log"), "term\n");
+        let saved = load_flatpaks(&lab.path("records.json"));
+        assert_eq!(saved.len(), 2, "{saved:?}");
+        assert!(saved.iter().all(|app| app.termed), "{saved:?}");
+    }
+
+    #[test]
+    fn updating_a_record_keeps_the_others_and_adds_a_missing_one() {
+        let lab = Lab::new();
+        let file = lab.path("records.json");
+        let record = |pid: u32| FlatpakApp {
+            app: APP.into(),
+            pid,
+            start_time: 7,
+            termed: false,
+            kill_attempts: 0,
+        };
+        save_flatpaks(&file, &[record(10), record(11)]);
+
+        let termed = FlatpakApp {
+            termed: true,
+            ..record(11)
+        };
+        update_flatpak_record(&file, &termed).unwrap();
+        assert_eq!(load_flatpaks(&file), [record(10), termed.clone()]);
+
+        update_flatpak_record(&file, &record(12)).unwrap();
+        assert_eq!(load_flatpaks(&file), [record(10), termed, record(12)]);
+    }
+
+    // A record that cannot be written is an error for the caller, and the close that
+    // could not record its intent still closes the app, once.
+    #[test]
+    fn a_record_that_cannot_be_written_does_not_stop_the_close() {
+        let lab = Lab::new();
+        let blocker = lab.path("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let unwritable = blocker.join("records.json");
+        let record = FlatpakApp {
+            app: APP.into(),
+            pid: 10,
+            start_time: 7,
+            termed: true,
+            kill_attempts: 0,
+        };
+        assert!(update_flatpak_record(&unwritable, &record).is_err());
+
+        let sandbox = lab.spawn(POLITE, "sandbox.log", &[]);
+        let mut env = (*lab.env(3000)).clone();
+        env.records = unwritable;
+        let env = Rc::new(env);
+        let app = lab.start_flatpak(&env, WATCHER, &[&sandbox.to_string()]);
+        let wrapper = app.flatpak.as_ref().unwrap().pid;
+        lab.write("ps.txt", &listing(wrapper, sandbox));
+        let result = block_on(stop_all_with(Some(app), env));
+        assert!(result.is_ok());
+        assert_eq!(lab.log("sandbox.log"), "term\n");
     }
 
     // The start half of the lifecycle: `start_with` records a Flatpak launch in the

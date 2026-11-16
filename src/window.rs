@@ -29,6 +29,9 @@ const NOT_CLOSED: &str = "Couldn't close the previous app";
 const PICKED_HINT: &str = "← → ↑ ↓  move  ·  Enter  drop  ·  Back  cancel";
 /// Holding Back on the main row this long asks to reset the tile order.
 const RESET_HOLD: Duration = Duration::from_secs(2);
+/// A close that takes this long is worth telling the user about; a quicker one is over
+/// before a message could be read.
+const CLOSING_HINT_DELAY: Duration = Duration::from_millis(400);
 
 /// What choosing a tile does. A configured tile does what its action says; the rest are
 /// the launcher's own, which a configuration cannot ask for.
@@ -39,28 +42,42 @@ enum Command {
     Cancel,
     /// Puts the tiles back in the configured order. Its confirmation has it.
     ResetOrder,
-    /// Opens a service of the catalog as a web app.
-    Web(&'static catalog::App),
+    /// Opens a service of the catalog: as a web app, or as its Flatpak app.
+    Service(&'static catalog::App),
     /// Puts something on the launcher; a choice on the Add page.
     Add(Addable),
     /// Picks the tile of the options page up, to move it.
     Move,
     /// Takes the tile of the options page off the launcher. Its confirmation has it.
     Remove,
+    /// Opens Setup & health, a choice on the Add page.
+    Health,
+    /// Runs the checks of Setup & health again.
+    Recheck,
+    /// Does nothing: a result on Setup & health, which says all it has to by being
+    /// selected.
+    Inert,
 }
 
 impl Command {
-    /// Whether the app behind it is installed; only a configured app, or a web app
-    /// without a browser (`browser` is the configured one, if any), can be missing.
+    /// Whether the app behind it is installed; only a configured app, a Flatpak service,
+    /// or a web app without a browser (`browser` is the configured one, if any), can be
+    /// missing.
     fn is_installed(&self, browser: Option<&str>) -> bool {
         match self {
             Command::Config(action) => launch::is_installed(action),
-            Command::Web(_) => webapp::find_browser(browser).is_some(),
+            Command::Service(app) => match app.flatpak {
+                Some(id) => launch::is_installed(&Action::Flatpak(id.to_owned())),
+                None => webapp::find_browser(browser).is_some(),
+            },
             Command::Cancel
             | Command::ResetOrder
             | Command::Add(_)
             | Command::Move
-            | Command::Remove => true,
+            | Command::Remove
+            | Command::Health
+            | Command::Recheck
+            | Command::Inert => true,
         }
     }
 }
@@ -100,6 +117,9 @@ enum Page {
     Add,
     /// Move or remove the tile `Ui::options_for` names.
     TileOptions,
+    /// What the launcher needs from its session, checked; made again each time it
+    /// opens and when the checks are run again.
+    Health,
 }
 
 /// What a confirmation page asks about: the actions that power the machine off or
@@ -128,9 +148,12 @@ impl Confirmable {
                 | Action::Submenu(_),
             )
             | Command::Cancel
-            | Command::Web(_)
+            | Command::Service(_)
             | Command::Add(_)
-            | Command::Move => None,
+            | Command::Move
+            | Command::Health
+            | Command::Recheck
+            | Command::Inert => None,
         }
     }
 
@@ -149,6 +172,7 @@ impl Page {
     const POWER: &'static str = "power";
     const ADD: &'static str = "add";
     const TILE_OPTIONS: &'static str = "options";
+    const HEALTH: &'static str = "health";
     const SUBMENU_PREFIX: &'static str = "submenu:";
     const CONFIRM_PREFIX: &'static str = "confirm:";
 
@@ -159,6 +183,7 @@ impl Page {
             Page::Power => Self::POWER.to_owned(),
             Page::Add => Self::ADD.to_owned(),
             Page::TileOptions => Self::TILE_OPTIONS.to_owned(),
+            Page::Health => Self::HEALTH.to_owned(),
             Page::Confirm(confirm) => format!("{}{}", Self::CONFIRM_PREFIX, confirm.key()),
         }
     }
@@ -184,6 +209,7 @@ impl Page {
             Self::POWER => Some(Page::Power),
             Self::ADD => Some(Page::Add),
             Self::TILE_OPTIONS => Some(Page::TileOptions),
+            Self::HEALTH => Some(Page::Health),
             _ => None,
         }
     }
@@ -234,12 +260,24 @@ pub fn command_line(
         }
         // Reports on the environment of this, the running instance, which is where a
         // service differs from a shell.
+        // The checks run without blocking the launcher. The command line is held until
+        // they are done, and the exit status is set then, not by this return.
         [flag] if flag == "--diagnose" => {
             let ui = ui(application);
-            let config = ui.as_ref().map(|ui| ui.config.borrow());
-            let (report, all_ok) = diagnose::run(config.as_deref());
-            command_line.print_literal(&report);
-            glib::ExitCode::from(u8::from(!all_ok))
+            let web_services = ui.as_ref().is_some_and(|ui| ui.web_services());
+            let checks = {
+                let config = ui.as_ref().map(|ui| ui.config.borrow());
+                diagnose::checks(config.as_deref(), web_services)
+            };
+            let (command_line, hold) = (command_line.clone(), application.hold());
+            glib::spawn_future_local(async move {
+                let (report, all_ok) = diagnose::render(&checks.await);
+                command_line.print_literal(&report);
+                command_line.set_exit_code(glib::ExitCode::from(u8::from(!all_ok)));
+                command_line.done();
+                drop(hold);
+            });
+            glib::ExitCode::SUCCESS
         }
         [flag] if flag == "--reload" => {
             if let Some(ui) = ui(application) {
@@ -430,6 +468,17 @@ enum Request {
     Tile(String, Action),
 }
 
+/// What the user is waiting for while the open app is closing, for the status line.
+fn closing_text(pending: Option<&Request>) -> String {
+    match pending {
+        Some(Request::Tile(name, _)) => {
+            format!("Closing the open app, then opening {name}  ·  Back  cancel")
+        }
+        Some(Request::Desktop) => "Closing the open app, then Desktop Mode".to_owned(),
+        Some(Request::Home) | None => "Closing the open app".to_owned(),
+    }
+}
+
 /// Lets one close run at a time. A request made while a close is running only replaces
 /// the pending one, so when the close finishes, just the latest request is acted on.
 struct CloseQueue<T> {
@@ -461,6 +510,25 @@ impl<T> CloseQueue<T> {
     /// Whether a close is running.
     fn is_busy(&self) -> bool {
         self.closing.get()
+    }
+}
+
+impl CloseQueue<Request> {
+    /// The tile whose app starts when the running close finishes, if that is what is
+    /// pending.
+    fn pending_tile(&self) -> Option<String> {
+        match self.pending.borrow().as_ref() {
+            Some(Request::Tile(name, _)) if self.closing.get() => Some(name.clone()),
+            _ => None,
+        }
+    }
+
+    /// Gives up the pending tile while a close is running: the close then ends at Home,
+    /// and the cleanup it does is unchanged. The name of the tile given up.
+    fn cancel_tile(&self) -> Option<String> {
+        let name = self.pending_tile()?;
+        self.pending.replace(Some(Request::Home));
+        Some(name)
     }
 }
 
@@ -511,6 +579,11 @@ struct Ui {
     options_for: RefCell<Option<(Page, usize)>>,
     /// The tiles of the Add page, made each time it opens.
     add_entries: RefCell<Vec<Entry>>,
+    /// The tiles of Setup & health: the checks run again, and what each found.
+    health_entries: RefCell<Vec<Entry>>,
+    /// Which run of the checks the page waits for; the result of an older one, from a page
+    /// opened and left since, is dropped.
+    health_run: Cell<u64>,
     /// The title label of each page that has one, for the pages whose title changes.
     titles: RefCell<HashMap<Page, gtk::Label>>,
     /// Serialises closes; see `close_then`.
@@ -559,6 +632,15 @@ struct Ui {
     back_timer: RefCell<Option<glib::SourceId>>,
     /// What the keys do while a tile is picked up.
     arrange_hint: gtk::Label,
+    /// What a close that is taking a while is for, with a spinner.
+    closing_hint: gtk::Box,
+    closing_label: gtk::Label,
+    /// The close has run for [`CLOSING_HINT_DELAY`], so its status may show.
+    closing_shown: Cell<bool>,
+    closing_timer: RefCell<Option<glib::SourceId>>,
+    /// The Back press that cancelled a launch is under way; its auto-repeat must neither
+    /// go back a page nor start the long press of Back.
+    back_swallow: Cell<bool>,
 }
 
 impl Ui {
@@ -606,6 +688,22 @@ impl Ui {
         arrange_hint.set_can_target(false);
         overlay.add_overlay(&arrange_hint);
 
+        // The same pill, for a close that takes a while; the two do not need each other.
+        let closing_label = gtk::Label::new(None);
+        let closing_hint = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(16)
+            .css_classes(["arrange-hint"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Start)
+            .margin_top(84)
+            .visible(false)
+            .can_target(false)
+            .build();
+        closing_hint.append(&gtk::Spinner::builder().spinning(true).build());
+        closing_hint.append(&closing_label);
+        overlay.add_overlay(&closing_hint);
+
         // Bottom-right, clear of the tile row and the key hints, like GNOME's
         // background logo. A picture is as wide as its image whatever size is
         // requested, so it sits in a window that has the size and no scroll bars.
@@ -651,6 +749,8 @@ impl Ui {
             power_button: power_button.clone(),
             options_for: RefCell::default(),
             add_entries: RefCell::default(),
+            health_entries: RefCell::default(),
+            health_run: Cell::new(0),
             titles: RefCell::default(),
             closes: CloseQueue::new(),
             stack,
@@ -674,6 +774,11 @@ impl Ui {
             back_down: Cell::new(false),
             back_timer: RefCell::default(),
             arrange_hint,
+            closing_hint,
+            closing_label,
+            closing_shown: Cell::new(false),
+            closing_timer: RefCell::default(),
+            back_swallow: Cell::new(false),
         });
 
         ui.add_config_pages();
@@ -832,6 +937,13 @@ impl Ui {
             let ui = ui.clone();
             move |window| {
                 if !window.is_active() {
+                    // The release of a key held when the focus left goes to the app
+                    // that took it, so nothing of its press may linger.
+                    ui.back_swallow.set(false);
+                    ui.back_down.set(false);
+                    if let Some(timer) = ui.back_timer.take() {
+                        timer.remove();
+                    }
                     ui.enter_held.set(false);
                     ui.enter_swallow.set(false);
                     ui.enter_down.set(false);
@@ -1081,6 +1193,22 @@ impl Ui {
         name.set_margin_top(44);
         let description = label("tile-description");
         description.set_margin_top(10);
+        // A long name or message wraps instead of widening the page past the screen.
+        for text in [&name, &description] {
+            text.set_wrap(true);
+            text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            text.set_justify(gtk::Justification::Center);
+        }
+        name.set_max_width_chars(40);
+        description.set_max_width_chars(70);
+        // Room for two lines of each, so the tiles above do not change size as the
+        // selection moves from a short name to a long one.
+        if page == Page::Health {
+            name.set_height_request(88);
+            name.set_valign(gtk::Align::End);
+            description.set_height_request(54);
+            description.set_valign(gtk::Align::Start);
+        }
         if positions.is_empty() {
             if let Some((title, detail)) = empty_page_text(&page) {
                 name.set_label(title);
@@ -1214,6 +1342,10 @@ impl Ui {
         if is_enter(key) {
             return self.enter_pressed();
         }
+        // The rest of a Back press that cancelled a launch.
+        if is_back(key) && self.back_swallow.get() {
+            return true;
+        }
         if self.picked.borrow().is_some() {
             match key {
                 Key::Left => self.move_picked(-1),
@@ -1236,6 +1368,12 @@ impl Ui {
                 }
                 None => false,
             },
+            // While an app is closing before another starts, Back gives that one up.
+            key if is_back(key) && self.closes.pending_tile().is_some() => {
+                self.cancel_pending_launch();
+                self.back_swallow.set(true);
+                true
+            }
             // Holding Back on the main row asks to reset the tile order. Back does
             // nothing else there, so the press is dealt with here.
             key if is_back(key) && self.on_main_page() => {
@@ -1257,6 +1395,9 @@ impl Ui {
         self.back_timer
             .replace(Some(glib::timeout_add_local_once(RESET_HOLD, move || {
                 ui.back_timer.take();
+                // The confirmation is open now, and the rest of this press, its
+                // auto-repeat, must not reach it and go back out of it.
+                ui.back_swallow.set(true);
                 let opener = GtkWindowExt::focus(&ui.window)
                     .and_then(|focus| focus.downcast::<gtk::Button>().ok())
                     .unwrap_or_else(|| ui.power_button.clone());
@@ -1266,6 +1407,7 @@ impl Ui {
     }
 
     fn back_released(&self) {
+        self.back_swallow.set(false);
         self.back_down.set(false);
         if let Some(timer) = self.back_timer.take() {
             timer.remove();
@@ -1472,7 +1614,14 @@ impl Ui {
         let before = saved.get(&key).unwrap_or(&identities);
         let order = tiles::order_to_save(before, shown, self.shown.borrow().hidden_on(&key));
         saved.insert(key, order);
-        order::save(&saved);
+        // The arrangement stays as the user made it and in memory, so the next change
+        // saves it again with the rest; until then it would be lost at a restart.
+        if let Err(error) = order::save(&saved) {
+            drop(saved);
+            self.notify(&format!(
+                "Couldn't save the tile order; it is lost at the next start ({error})"
+            ));
+        }
     }
 
     /// The first tile of a page is what is selected when it opens.
@@ -1633,6 +1782,7 @@ impl Ui {
             Page::Main => self.main.borrow()[index].clone(),
             Page::Submenu(name) => self.submenus.borrow()[name][index].clone(),
             Page::Add => self.add_entries.borrow()[index].clone(),
+            Page::Health => self.health_entries.borrow()[index].clone(),
             Page::Power | Page::Confirm(_) | Page::TileOptions => self
                 .own_pages
                 .iter()
@@ -1672,6 +1822,16 @@ impl Ui {
                 self.add_tile(*offer);
                 Ok(())
             }
+            Command::Health => {
+                self.open_health(button);
+                Ok(())
+            }
+            Command::Recheck => {
+                self.show_health(vec![checking_entry()]);
+                self.run_health();
+                Ok(())
+            }
+            Command::Inert => Ok(()),
             Command::Move => {
                 self.begin_move();
                 Ok(())
@@ -1681,14 +1841,22 @@ impl Ui {
                 self.remove_selected();
                 Ok(())
             }
-            Command::Web(_) if !self.installed(&entry.command) => {
-                self.notify(&format!(
-                    "{} needs a browser, and none is installed",
-                    entry.name
-                ));
+            Command::Service(app) if !self.installed(&entry.command) => {
+                self.notify(&if app.flatpak.is_some() {
+                    format!("{} isn't installed", entry.name)
+                } else {
+                    format!("{} needs a browser, and none is installed", entry.name)
+                });
                 Ok(())
             }
-            Command::Web(app) => self.open_web_app(page, entry, app, button),
+            Command::Service(app) => match app.flatpak {
+                Some(id) => {
+                    self.remember_origin(page, button);
+                    self.launch(&entry.name, &Action::Flatpak(id.to_owned()));
+                    Ok(())
+                }
+                None => self.open_web_app(page, entry, app, button),
+            },
             Command::Cancel => {
                 self.back();
                 Ok(())
@@ -1755,13 +1923,17 @@ impl Ui {
     fn close_then(self: &Rc<Self>, request: Request) {
         if !self.closes.submit(request) {
             // Nothing has started since that close began, so `running` is empty.
+            self.update_closing_hint();
             return;
         }
+        self.begin_closing_hint();
         let launched = self.running.take();
         let ui = self.clone();
         glib::spawn_future_local(async move {
             let closed = launch::stop_all(launched).await;
             let request = ui.closes.finish();
+            // Whichever way the close ended, nothing is closing any more.
+            ui.end_closing_hint();
             match closed {
                 Ok(()) => {}
                 Err(launch::StopError::Timeout) => {
@@ -1789,9 +1961,102 @@ impl Ui {
             match request {
                 Some(Request::Tile(name, action)) => ui.start(&name, &action),
                 Some(Request::Desktop) => ui.hide_for_desktop(),
-                Some(Request::Home) | None => {}
+                // Showing the launcher for Home could not reload the configuration
+                // while this close ran, so it is done now.
+                Some(Request::Home) | None => ui.reload_keeping_selection(),
             }
         });
+    }
+
+    /// The status of a close that is taking a while: what it is for, shown only while
+    /// one runs and has run for [`CLOSING_HINT_DELAY`].
+    fn update_closing_hint(&self) {
+        let show = self.closes.is_busy() && self.closing_shown.get();
+        if show {
+            self.closing_label
+                .set_label(&closing_text(self.closes.pending.borrow().as_ref()));
+        }
+        self.closing_hint.set_visible(show);
+    }
+
+    fn begin_closing_hint(self: &Rc<Self>) {
+        let ui = self.clone();
+        let timer = glib::timeout_add_local_once(CLOSING_HINT_DELAY, move || {
+            ui.closing_timer.take();
+            ui.closing_shown.set(true);
+            ui.update_closing_hint();
+        });
+        if let Some(old) = self.closing_timer.replace(Some(timer)) {
+            old.remove();
+        }
+    }
+
+    fn end_closing_hint(&self) {
+        if let Some(timer) = self.closing_timer.take() {
+            timer.remove();
+        }
+        self.closing_shown.set(false);
+        self.update_closing_hint();
+    }
+
+    /// Gives up the app that starts once the close finishes; the close itself goes on.
+    fn cancel_pending_launch(&self) {
+        if let Some(name) = self.closes.cancel_tile() {
+            self.sounds.chosen();
+            self.notify(&format!("Cancelled opening {name}"));
+            self.update_closing_hint();
+        }
+    }
+
+    /// The identity of the main-row tile that has the focus, if one does.
+    fn main_selection(&self) -> Option<order::Identity> {
+        let index = self
+            .arrangeable
+            .borrow()
+            .get(&Page::Main)?
+            .buttons
+            .iter()
+            .find(|(_, button)| button.is_focus())
+            .map(|(index, _)| *index)?;
+        let names = self.listed_names(&Page::Main);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        order::identities(&names).get(index).cloned()
+    }
+
+    /// Selects the main-row tile with `identity`, if the row still has it.
+    fn select_main(&self, identity: &order::Identity) {
+        let names = self.listed_names(&Page::Main);
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let Some(index) = order::identities(&names)
+            .iter()
+            .position(|other| other == identity)
+        else {
+            return;
+        };
+        let button = self
+            .arrangeable
+            .borrow()
+            .get(&Page::Main)
+            .and_then(|tiles| {
+                tiles
+                    .buttons
+                    .iter()
+                    .find(|(i, _)| *i == index)
+                    .map(|(_, button)| button.clone())
+            });
+        if let Some(button) = button {
+            button.grab_focus();
+        }
+    }
+
+    /// Reloads the configuration, as showing the launcher does, and keeps the tile that
+    /// was selected selected if it is still there; the pages are rebuilt if it changed.
+    fn reload_keeping_selection(self: &Rc<Self>) {
+        let selected = self.main_selection();
+        self.reload(false);
+        if let Some(identity) = selected {
+            self.select_main(&identity);
+        }
     }
 
     fn start(self: &Rc<Self>, name: &str, action: &Action) {
@@ -1893,7 +2158,7 @@ impl Ui {
             tiles.grid.position(button)
         });
         match entry.command {
-            Command::Web(app) => self.shown.borrow_mut().remove(app.id),
+            Command::Service(app) => self.shown.borrow_mut().remove(app.id),
             _ => {
                 let names = self.listed_names(&page);
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -1949,27 +2214,88 @@ impl Ui {
 
     /// Opens the Add page, made for what can be added now.
     fn open_add(self: &Rc<Self>, opener: &gtk::Button) {
-        let key = Page::Add.key();
-        if let Some(old) = self.stack.child_by_name(&key) {
-            self.stack.remove(&old);
-        }
-        self.first_tiles.borrow_mut().remove(&Page::Add);
-        self.labels.borrow_mut().remove(&Page::Add);
-        self.titles.borrow_mut().remove(&Page::Add);
-        self.missing
-            .borrow_mut()
-            .retain(|(page, _)| *page != Page::Add);
-        self.rows
-            .borrow_mut()
-            .retain(|row| row.widget().root().is_some());
+        self.forget_page(&Page::Add);
 
-        let entries = self.addable_entries();
+        let mut entries = self.addable_entries();
+        entries.push(entry(
+            "Setup & health",
+            "preferences-system-symbolic",
+            "Check what the launcher needs from its session",
+            Command::Health,
+        ));
         *self.add_entries.borrow_mut() = entries.clone();
         self.add_page(Page::Add, Some("Add a tile"), &entries, false);
         if self.width.get() > 0 {
             self.fit_tiles(self.width.get(), self.height.get());
         }
         self.open(Page::Add, opener);
+    }
+
+    /// Drops a page that is made again each time, with what the launcher keeps of it, so
+    /// it can be added anew.
+    fn forget_page(&self, page: &Page) {
+        if let Some(old) = self.stack.child_by_name(&page.key()) {
+            self.stack.remove(&old);
+        }
+        self.first_tiles.borrow_mut().remove(page);
+        self.labels.borrow_mut().remove(page);
+        self.titles.borrow_mut().remove(page);
+        self.missing.borrow_mut().retain(|(of, _)| of != page);
+        self.rows
+            .borrow_mut()
+            .retain(|row| row.widget().root().is_some());
+    }
+
+    /// Opens Setup & health, saying it is checking, and runs the checks.
+    fn open_health(self: &Rc<Self>, opener: &gtk::Button) {
+        self.show_health(vec![checking_entry()]);
+        self.open(Page::Health, opener);
+        self.run_health();
+    }
+
+    /// Runs the checks, without blocking: the page stays usable, and Back leaves it. The
+    /// result replaces the page unless another run was started meanwhile.
+    fn run_health(self: &Rc<Self>) {
+        let run = self.health_run.get() + 1;
+        self.health_run.set(run);
+        let checks = {
+            let config = self.config.borrow();
+            diagnose::checks(Some(&config), self.web_services())
+        };
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            let checks = checks.await;
+            if ui.health_run.get() == run {
+                ui.show_health(health_entries(&checks));
+            }
+        });
+    }
+
+    /// Whether a web service of the catalog is on the main row, which is what needs a
+    /// browser.
+    fn web_services(&self) -> bool {
+        self.main
+            .borrow()
+            .iter()
+            .any(|entry| matches!(entry.command, Command::Service(app) if app.flatpak.is_none()))
+    }
+
+    /// Makes Setup & health from `entries`, in place of the one there. If it is the page
+    /// shown, it stays so, with the first tile selected.
+    fn show_health(self: &Rc<Self>, entries: Vec<Entry>) {
+        let shown = self.current_page() == Page::Health;
+        self.forget_page(&Page::Health);
+        *self.health_entries.borrow_mut() = entries.clone();
+        self.add_page(Page::Health, Some("Setup & health"), &entries, false);
+        if self.width.get() > 0 {
+            self.fit_tiles(self.width.get(), self.height.get());
+        }
+        if shown {
+            self.stack.set_visible_child_name(&Page::Health.key());
+            if let Some(first) = self.first_tiles.borrow().get(&Page::Health) {
+                first.grab_focus();
+            }
+        }
     }
 
     /// What the Add page offers: removed tiles first, then the catalog.
@@ -2045,8 +2371,11 @@ impl Ui {
     }
 
     fn save_shown(&self) {
-        if !self.shown.borrow().save() {
-            self.notify("Couldn't save the change; it is lost at the next start");
+        let saved = self.shown.borrow().save();
+        if let Err(error) = saved {
+            self.notify(&format!(
+                "Couldn't save the change; it is lost at the next start ({error})"
+            ));
         }
     }
 
@@ -2317,6 +2646,43 @@ fn own_pages() -> Vec<OwnPage> {
     ]
 }
 
+/// What Setup & health shows while the checks run.
+fn checking_entry() -> Entry {
+    entry(
+        "Checking…",
+        "content-loading-symbolic",
+        "This takes a moment; Back leaves",
+        Command::Inert,
+    )
+}
+
+/// The tiles of Setup & health: one to run the checks again, saying how the last run
+/// went, then a tile per check, the ones that failed first.
+fn health_entries(checks: &[diagnose::Check]) -> Vec<Entry> {
+    let failed = checks.iter().filter(|check| check.outcome.is_err()).count();
+    let summary = if failed == 0 {
+        format!("All {} checks passed", checks.len())
+    } else {
+        format!("{failed} of {} checks failed", checks.len())
+    };
+    let mut entries = vec![entry(
+        "Check again",
+        "view-refresh-symbolic",
+        &summary,
+        Command::Recheck,
+    )];
+    let (failed, passed): (Vec<_>, Vec<_>) =
+        checks.iter().partition(|check| check.outcome.is_err());
+    for check in failed.into_iter().chain(passed) {
+        let (icon, text) = match &check.outcome {
+            Ok(found) => ("emblem-ok-symbolic", found),
+            Err(why) => ("dialog-warning-symbolic", why),
+        };
+        entries.push(entry(&check.what, icon, text, Command::Inert));
+    }
+    entries
+}
+
 /// The tiles of the main row: the configured ones, then the services that were added.
 fn main_entries(config: &Config, shown: &tiles::Shown) -> Vec<Entry> {
     let names: Vec<&str> = config.tiles.iter().map(|tile| tile.name.as_str()).collect();
@@ -2342,7 +2708,7 @@ fn catalog_entry(app: &'static catalog::App) -> Entry {
         name: app.name.to_owned(),
         icon: Some(app.icon()),
         description: Some(app.description.to_owned()),
-        command: Command::Web(app),
+        command: Command::Service(app),
     }
 }
 
@@ -2397,7 +2763,6 @@ fn empty_page_text(page: &Page) -> Option<(&'static str, &'static str)> {
     match page {
         Page::Main => Some(("No tiles yet", "Press + to add some")),
         Page::Submenu(_) => Some(("No tiles here", "Put them back with + on the main row")),
-        Page::Add => Some(("Everything is already on the launcher", "")),
         _ => None,
     }
 }
@@ -2534,8 +2899,8 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_back, is_enter, is_navigation, is_settings, order_listing, own_pages, CloseQueue,
-        Command, Confirmable, Page, Request,
+        closing_text, health_entries, is_back, is_enter, is_navigation, is_settings, order_listing,
+        own_pages, CloseQueue, Command, Confirmable, Page, Request,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -2648,7 +3013,7 @@ mod tests {
             (Command::Remove, true),
             (Command::Move, false),
             (
-                Command::Web(crate::catalog::find("netflix").unwrap()),
+                Command::Service(crate::catalog::find("netflix").unwrap()),
                 false,
             ),
             (
@@ -2663,9 +3028,45 @@ mod tests {
             (config(Action::Flatpak("a.b".into())), false),
             (config(Action::Submenu("Games".into())), false),
             (Command::Cancel, false),
+            (Command::Health, false),
+            (Command::Recheck, false),
+            (Command::Inert, false),
         ] {
             assert_eq!(Confirmable::of(&command).is_some(), needs, "{command:?}");
         }
+    }
+
+    // Failed checks come first, after the tile that runs them again, which says how the
+    // last run went; no check does anything when chosen.
+    #[test]
+    fn the_health_page_lists_failures_first_and_summarises_the_run() {
+        let check = |what: &str, outcome: Result<&str, &str>| crate::diagnose::Check {
+            what: what.to_owned(),
+            outcome: outcome.map(str::to_owned).map_err(str::to_owned),
+        };
+        let entries = health_entries(&[
+            check("a", Ok("fine")),
+            check("b", Err("broken")),
+            check("c", Ok("fine")),
+            check("d", Err("also broken")),
+        ]);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Check again", "b", "d", "a", "c"]);
+        assert_eq!(entries[0].command, Command::Recheck);
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("2 of 4 checks failed")
+        );
+        assert_eq!(entries[1].description.as_deref(), Some("broken"));
+        assert_eq!(entries[1].icon.as_deref(), Some("dialog-warning-symbolic"));
+        assert_eq!(entries[3].icon.as_deref(), Some("emblem-ok-symbolic"));
+        assert!(entries[1..].iter().all(|e| e.command == Command::Inert));
+
+        let all_good = health_entries(&[check("a", Ok("fine"))]);
+        assert_eq!(
+            all_good[0].description.as_deref(),
+            Some("All 1 checks passed")
+        );
     }
 
     // What `--print-order` prints is what the rows show: the saved arrangement, by the keys
@@ -2733,6 +3134,7 @@ mod tests {
         // The pages that came with adding and removing tiles.
         assert_eq!(Page::Add.key(), "add");
         assert_eq!(Page::TileOptions.key(), "options");
+        assert_eq!(Page::Health.key(), "health");
         assert_eq!(
             Page::Confirm(Confirmable::RemoveTile).key(),
             "confirm:remove"
@@ -2743,7 +3145,13 @@ mod tests {
 
     #[test]
     fn a_page_is_found_again_from_its_key() {
-        let mut pages = vec![Page::Main, Page::Power, Page::Add, Page::TileOptions];
+        let mut pages = vec![
+            Page::Main,
+            Page::Power,
+            Page::Add,
+            Page::TileOptions,
+            Page::Health,
+        ];
         // Submenu names are the user's, whatever they hold.
         for name in [
             "Games",
@@ -2826,7 +3234,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Netflix");
         assert_eq!(entries[0].icon.as_deref(), Some("vextheater-netflix"));
-        assert!(matches!(entries[0].command, Command::Web(app) if app.id == "netflix"));
+        assert!(matches!(entries[0].command, Command::Service(app) if app.id == "netflix"));
+    }
+
+    // Jellyfin is a Flatpak app: it is found by its Flatpak id, not by a browser, so a
+    // browser configured to something missing does not make it "not installed", and a
+    // launcher with only it needs no browser.
+    #[test]
+    fn a_flatpak_service_does_not_need_a_browser() {
+        let jellyfin = Command::Service(crate::catalog::find("jellyfin").unwrap());
+        assert_eq!(
+            jellyfin.is_installed(Some("/no/such/browser")),
+            crate::launch::is_installed(&Action::Flatpak("org.jellyfin.JellyfinDesktop".into()))
+        );
+        let netflix = Command::Service(crate::catalog::find("netflix").unwrap());
+        assert!(!netflix.is_installed(Some("/no/such/browser")));
     }
 
     // A reload waits while a close runs, so the queue says whether one does.
@@ -2838,6 +3260,59 @@ mod tests {
         assert!(queue.is_busy());
         queue.finish();
         assert!(!queue.is_busy());
+    }
+
+    fn tile(name: &str) -> Request {
+        Request::Tile(name.into(), Action::Command(name.to_lowercase()))
+    }
+
+    // A, then B while A's close runs: only B is acted on, and the status names B.
+    #[test]
+    fn the_latest_tile_chosen_during_a_close_is_the_only_one_started() {
+        let queue = CloseQueue::new();
+        assert!(queue.submit(tile("A")));
+        assert!(!queue.submit(tile("B")));
+        assert_eq!(queue.pending_tile().as_deref(), Some("B"));
+        assert_eq!(
+            closing_text(queue.pending.borrow().as_ref()),
+            "Closing the open app, then opening B  ·  Back  cancel"
+        );
+        assert!(matches!(queue.finish(), Some(Request::Tile(name, _)) if name == "B"));
+        assert!(queue.pending_tile().is_none());
+    }
+
+    // Cancelling replaces the pending tile with Home: the close finishes as it was going
+    // to and no app starts.
+    #[test]
+    fn cancelling_a_pending_tile_leaves_the_close_to_end_at_home() {
+        let queue = CloseQueue::new();
+        assert!(queue.submit(tile("A")));
+        assert_eq!(queue.cancel_tile().as_deref(), Some("A"));
+        assert!(queue.is_busy(), "the close itself goes on");
+        assert!(queue.pending_tile().is_none());
+        assert_eq!(queue.cancel_tile(), None, "nothing left to give up");
+        assert!(matches!(queue.finish(), Some(Request::Home)));
+    }
+
+    // With no close running there is nothing pending to cancel, and no stale status.
+    #[test]
+    fn nothing_is_pending_once_the_close_has_finished() {
+        let queue = CloseQueue::new();
+        assert_eq!(queue.cancel_tile(), None);
+        queue.submit(tile("A"));
+        queue.finish();
+        assert_eq!(queue.cancel_tile(), None);
+        assert!(queue.pending_tile().is_none());
+    }
+
+    #[test]
+    fn the_closing_status_says_what_follows() {
+        assert_eq!(closing_text(None), "Closing the open app");
+        assert_eq!(closing_text(Some(&Request::Home)), "Closing the open app");
+        assert_eq!(
+            closing_text(Some(&Request::Desktop)),
+            "Closing the open app, then Desktop Mode"
+        );
     }
 
     #[test]

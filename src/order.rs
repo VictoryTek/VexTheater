@@ -23,10 +23,16 @@ pub fn load() -> Saved {
     files::read_json(&file(), "the saved tile order").unwrap_or_default()
 }
 
-pub fn save(saved: &Saved) {
-    if let Err(error) = files::write_json(&file(), saved) {
+/// Saves the order. A failure is logged and returned, since the arrangement would not
+/// survive a restart and the caller must say so.
+pub fn save(saved: &Saved) -> std::io::Result<()> {
+    save_to(&file(), saved)
+}
+
+fn save_to(path: &std::path::Path, saved: &Saved) -> std::io::Result<()> {
+    files::write_json(path, saved).inspect_err(|error| {
         log::warn!("cannot save the tile order: {error}");
-    }
+    })
 }
 
 /// Forgets the saved order, so the tiles are back in the configured order. It is an
@@ -185,6 +191,28 @@ mod tests {
         order.insert("main".into(), saved_with(&[("B", 0), ("A", 1)]));
         let text = serde_json::to_string(&order).unwrap();
         assert_eq!(read("good.json", &text), order);
+    }
+
+    #[test]
+    fn a_failed_save_is_an_error_and_leaves_the_saved_file_alone() {
+        let dir =
+            std::env::temp_dir().join(format!("vextheater-order-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut order = Saved::new();
+        order.insert("main".into(), saved_with(&[("B", 0), ("A", 0)]));
+
+        // The directory for the file is a regular file, so it cannot be created.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        assert!(save_to(&blocker.join("order.json"), &order).is_err());
+
+        // A good save works, and a later failed one does not disturb it.
+        let path = dir.join("order.json");
+        save_to(&path, &order).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        std::fs::create_dir_all(path.with_extension("json.tmp")).unwrap();
+        assert!(save_to(&path, &Saved::new()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

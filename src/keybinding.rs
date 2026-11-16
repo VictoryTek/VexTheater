@@ -63,6 +63,56 @@ pub fn sync(home_key: Option<&str>) {
     sync_with(&store, home_key, &command());
 }
 
+/// What the shortcut is now, against what `home_key` says it should be, for the health
+/// report. Nothing is written: [`sync`] does that, at the start and on a reload. None
+/// when there is nothing to report: no home key and no shortcut of ours, or no GNOME
+/// schemas, which the report already says.
+pub fn status(home_key: Option<&str>) -> Option<Result<String, String>> {
+    status_with(&GSettingsStore::open()?, home_key, &command())
+}
+
+fn status_with(
+    store: &impl Store,
+    home_key: Option<&str>,
+    command: &str,
+) -> Option<Result<String, String>> {
+    let listed = store.list().iter().any(|path| path == ENTRY_PATH);
+    let Some(binding) = home_key.filter(|key| !key.is_empty()) else {
+        return listed.then(|| {
+            Err(
+                "a shortcut of the launcher is still set, but the configuration has no \
+                 homeKey; it is removed at the next start or reload"
+                    .to_owned(),
+            )
+        });
+    };
+    if !listed {
+        return Some(Err(
+            "it is not among GNOME's custom shortcuts; it is added at the next start or reload"
+                .to_owned(),
+        ));
+    }
+    let entry = store.entry();
+    Some(if entry.binding != binding {
+        Err(format!(
+            "the key is \"{}\", but the configuration says \"{binding}\"",
+            entry.binding
+        ))
+    } else if entry.command != command {
+        Err(format!(
+            "it runs \"{}\" instead of \"{command}\"",
+            entry.command
+        ))
+    } else if entry.name != NAME {
+        Err(format!(
+            "it is named \"{}\" instead of \"{NAME}\"",
+            entry.name
+        ))
+    } else {
+        Ok(format!("{binding} runs {command}"))
+    })
+}
+
 /// An empty `home_key` is no home key.
 fn sync_with(store: &impl Store, home_key: Option<&str>, command: &str) {
     let home_key = home_key.filter(|key| !key.is_empty());
@@ -357,6 +407,52 @@ mod tests {
         sync_with(&store, None, HOME);
         sync_with(&store, None, HOME);
         assert_eq!(store.writes(), 0);
+    }
+
+    fn ours(binding: &str, command: &str) -> Fake {
+        let store = Fake::with_list(&[THEIRS, ENTRY_PATH]);
+        *store.entry.borrow_mut() = Entry {
+            name: "VexTheater home".into(),
+            command: command.into(),
+            binding: binding.into(),
+        };
+        store
+    }
+
+    #[test]
+    fn a_right_shortcut_is_reported_as_it_is() {
+        let store = ours("F10", HOME);
+        assert_eq!(
+            status_with(&store, Some("F10"), HOME),
+            Some(Ok("F10 runs vextheater --home".to_owned()))
+        );
+    }
+
+    // Each way the shortcut can be wrong says which, and none of them writes.
+    #[test]
+    fn a_wrong_shortcut_says_what_is_wrong_and_is_left_alone() {
+        let wrong_key = status_with(&ours("F9", HOME), Some("F10"), HOME);
+        assert!(wrong_key.unwrap().unwrap_err().contains("\"F9\""));
+        let wrong_command = status_with(&ours("F10", "/old --home"), Some("F10"), HOME);
+        assert!(wrong_command.unwrap().unwrap_err().contains("/old --home"));
+        let unlisted = Fake::with_list(&[THEIRS]);
+        let missing = status_with(&unlisted, Some("F10"), HOME);
+        assert!(missing.unwrap().unwrap_err().contains("not among"));
+        assert_eq!(unlisted.writes(), 0);
+        let store = ours("F9", "/old --home");
+        let _ = status_with(&store, Some("F10"), HOME);
+        assert_eq!(store.writes(), 0);
+    }
+
+    #[test]
+    fn without_a_home_key_only_a_leftover_shortcut_is_reported() {
+        assert_eq!(status_with(&Fake::with_list(&[THEIRS]), None, HOME), None);
+        assert_eq!(
+            status_with(&Fake::with_list(&[THEIRS]), Some(""), HOME),
+            None
+        );
+        let leftover = status_with(&ours("F10", HOME), None, HOME);
+        assert!(leftover.unwrap().is_err());
     }
 
     // The command names the program of the running system when that exists, never a

@@ -34,16 +34,16 @@ impl Shown {
         files::read_json(&file(), "the added and removed tiles").unwrap_or_default()
     }
 
-    /// Saves the state; true if it was written. A failure is logged and the caller says
-    /// so, since the change would not survive a restart.
-    pub fn save(&self) -> bool {
-        match files::write_json(&file(), self) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!("cannot save the added and removed tiles: {error}");
-                false
-            }
-        }
+    /// Saves the state. A failure is logged and returned, and the caller says so, since
+    /// the change would not survive a restart.
+    pub fn save(&self) -> std::io::Result<()> {
+        self.save_to(&file())
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        files::write_json(path, self).inspect_err(|error| {
+            log::warn!("cannot save the added and removed tiles: {error}");
+        })
     }
 
     /// Puts a service of the catalog on the main row. Nothing for an id the catalog does
@@ -468,6 +468,24 @@ mod tests {
                 r#"{ "added": ["netflix"], "hidden": { "main": [["Plex", 0]] } }"#
             ),
             state(&["netflix"], &[(MAIN, &["Plex"])])
+        );
+    }
+
+    #[test]
+    fn a_failed_save_is_an_error() {
+        let dir =
+            std::env::temp_dir().join(format!("vextheater-tiles-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let now = state(&["netflix"], &[]);
+        assert!(now.save_to(&blocker.join("tiles.json")).is_err());
+
+        let path = dir.join("tiles.json");
+        now.save_to(&path).unwrap();
+        assert_eq!(
+            read("saved.json", &std::fs::read_to_string(&path).unwrap()),
+            now
         );
     }
 
