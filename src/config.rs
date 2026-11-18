@@ -95,20 +95,11 @@ impl TryFrom<RawTile> for Tile {
             actions.push(("builtin", Action::Builtin(builtin)));
         }
         let name = raw.name;
-        let (kind, action) = match actions.len() {
-            0 => return Err(format!("tile \"{name}\" has no action")),
-            1 => actions.remove(0),
-            _ => {
-                let keys: Vec<_> = actions.iter().map(|(key, _)| *key).collect();
-                return Err(format!(
-                    "tile \"{name}\" has more than one action ({})",
-                    keys.join(", ")
-                ));
-            }
-        };
-        if raw.icon.is_none() && !matches!(kind, "desktop" | "flatpak") {
-            return Err(format!("tile \"{name}\" has no icon"));
-        }
+        let kinds: Vec<&'static str> = actions.iter().map(|(key, _)| *key).collect();
+        let fault_in = |fault: TileFault| fault.describe(&format!("tile \"{name}\""), "");
+        let kind = select_action(&kinds).map_err(fault_in)?;
+        check_icon(kind, raw.icon.is_some()).map_err(fault_in)?;
+        let action = actions.remove(0).1;
         Ok(Tile {
             name,
             icon: raw.icon,
@@ -133,12 +124,37 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "String")]
 pub enum Builtin {
     /// Hide the launcher and show the GNOME desktop.
     DesktopMode,
     Shutdown,
     Restart,
+}
+
+impl Builtin {
+    /// Every builtin with the name a configuration gives it: the one list of them, which
+    /// loading and the error messages both use.
+    const ALL: [(&'static str, Builtin); 3] = [
+        ("desktop-mode", Builtin::DesktopMode),
+        ("shutdown", Builtin::Shutdown),
+        ("restart", Builtin::Restart),
+    ];
+
+    fn parse(name: &str) -> Option<Builtin> {
+        Self::ALL
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, builtin)| *builtin)
+    }
+}
+
+impl TryFrom<String> for Builtin {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Builtin, String> {
+        Builtin::parse(&name).ok_or_else(|| format!("unknown builtin \"{name}\""))
+    }
 }
 
 impl Config {
@@ -223,8 +239,67 @@ impl Config {
 /// The keys that give a tile its action; one of them is required.
 const ACTIONS: [&str; 5] = ["command", "desktop", "flatpak", "submenu", "builtin"];
 
-/// The `builtin` values a configuration may use; see [`Builtin`].
-const BUILTINS: [&str; 3] = ["desktop-mode", "shutdown", "restart"];
+/// What can be wrong with a tile's keys beyond their types: the rules of a tile, in one
+/// place. Loading (`TryFrom<RawTile>`) and `locate`'s messages both come here, so a rule
+/// is changed once.
+enum TileFault {
+    NoAction,
+    SeveralActions(Vec<&'static str>),
+    UnknownBuiltin(String),
+    NoIcon,
+}
+
+impl TileFault {
+    /// The message, for the tile at `path` (`of` is its ` (tile "name")` suffix, if any).
+    fn describe(&self, path: &str, of: &str) -> String {
+        match self {
+            TileFault::NoAction => {
+                format!(
+                    "{path}: has no action, add one of {}{of}",
+                    ACTIONS.join(", ")
+                )
+            }
+            TileFault::SeveralActions(keys) => {
+                format!("{path}: has more than one action ({}){of}", keys.join(", "))
+            }
+            TileFault::UnknownBuiltin(value) => {
+                let names: Vec<&str> = Builtin::ALL.iter().map(|(name, _)| *name).collect();
+                format!(
+                    "{path}.builtin: \"{value}\" is not one of {}{of}",
+                    names.join(", ")
+                )
+            }
+            TileFault::NoIcon => format!("{path}.icon: missing{of}"),
+        }
+    }
+}
+
+/// The one action key a tile has, out of those `given`.
+fn select_action(given: &[&'static str]) -> Result<&'static str, TileFault> {
+    match given {
+        [] => Err(TileFault::NoAction),
+        [action] => Ok(*action),
+        several => Err(TileFault::SeveralActions(several.to_vec())),
+    }
+}
+
+/// A `builtin` action must name a builtin; the other actions take any string.
+fn check_action_value(action: &str, value: &str) -> Result<(), TileFault> {
+    if action == "builtin" && Builtin::parse(value).is_none() {
+        return Err(TileFault::UnknownBuiltin(value.to_owned()));
+    }
+    Ok(())
+}
+
+/// Only a `desktop` or a `flatpak` tile can do without an icon: the launcher finds the
+/// application's own.
+fn check_icon(action: &str, has_icon: bool) -> Result<(), TileFault> {
+    if has_icon || matches!(action, "desktop" | "flatpak") {
+        Ok(())
+    } else {
+        Err(TileFault::NoIcon)
+    }
+}
 
 /// The keys of the configuration.
 const KEYS: [&str; 6] = [
@@ -313,38 +388,25 @@ fn locate_in_tile(path: &str, tile: &serde_json::Value) -> Option<String> {
             return Some(format!("{path}.{key}: must be a string{of}"));
         }
     }
-    let actions: Vec<_> = ACTIONS
+    let actions: Vec<&'static str> = ACTIONS
         .into_iter()
         .filter(|key| given(key).is_some())
         .collect();
-    let [action] = actions.as_slice() else {
-        return Some(if actions.is_empty() {
-            format!(
-                "{path}: has no action, add one of {}{of}",
-                ACTIONS.join(", ")
-            )
-        } else {
-            format!(
-                "{path}: has more than one action ({}){of}",
-                actions.join(", ")
-            )
-        });
+    let fault = |fault: TileFault| Some(fault.describe(path, &of));
+    let action = match select_action(&actions) {
+        Ok(action) => action,
+        Err(problem) => return fault(problem),
     };
-    match given(action)?.as_str() {
-        None => return Some(format!("{path}.{action}: must be a string{of}")),
-        Some(value) if *action == "builtin" && !BUILTINS.contains(&value) => {
-            return Some(format!(
-                "{path}.builtin: \"{value}\" is not one of {}{of}",
-                BUILTINS.join(", ")
-            ))
-        }
-        Some(_) => {}
+    let Some(value) = given(action)?.as_str() else {
+        return Some(format!("{path}.{action}: must be a string{of}"));
+    };
+    if let Err(problem) = check_action_value(action, value) {
+        return fault(problem);
     }
-    // Only these two can do without: the launcher finds the application's own icon.
-    if given("icon").is_none() && !matches!(*action, "desktop" | "flatpak") {
-        return Some(format!("{path}.icon: missing{of}"));
+    match check_icon(action, given("icon").is_some()) {
+        Err(problem) => fault(problem),
+        Ok(()) => None,
     }
-    None
 }
 
 fn is_power_tile(tile: &Tile, submenus: &BTreeMap<String, Vec<Tile>>) -> bool {
@@ -681,11 +743,60 @@ mod tests {
     // `locate` words errors for the builtins it lists, so they must be accepted.
     #[test]
     fn every_listed_builtin_is_accepted() {
-        for builtin in BUILTINS {
+        for (builtin, _) in Builtin::ALL {
             let text = format!(
                 r#"{{ "tiles": [ {{ "name": "A", "icon": "a", "builtin": "{builtin}" }} ] }}"#
             );
             assert!(Config::parse(&text).is_ok(), "{builtin}");
+        }
+    }
+
+    // A builtin added to the enum must be added to `Builtin::ALL`, or it could not be
+    // written in a configuration: this match stops compiling until it is handled.
+    #[test]
+    fn every_builtin_variant_is_listed_under_its_name() {
+        let name_of = |builtin: Builtin| match builtin {
+            Builtin::DesktopMode => "desktop-mode",
+            Builtin::Shutdown => "shutdown",
+            Builtin::Restart => "restart",
+        };
+        assert_eq!(Builtin::ALL.len(), 3);
+        for (name, builtin) in Builtin::ALL {
+            assert_eq!(name_of(builtin), name);
+            assert_eq!(Builtin::parse(name), Some(builtin));
+        }
+        assert_eq!(Builtin::parse("sleep"), None);
+    }
+
+    // Loading and the message for a refused tile apply the same rules: the tile that
+    // `locate` words is one `Tile` refuses, and for the same reason.
+    #[test]
+    fn loading_and_the_messages_agree_on_what_a_tile_may_be() {
+        let cases = [
+            (r#"{ "name": "A", "icon": "a" }"#, "has no action"),
+            (
+                r#"{ "name": "A", "icon": "a", "command": "x", "flatpak": "y" }"#,
+                "has more than one action (command, flatpak)",
+            ),
+            (r#"{ "name": "A", "command": "x" }"#, ".icon: missing"),
+            (
+                r#"{ "name": "A", "icon": "a", "builtin": "sleep" }"#,
+                "is not one of desktop-mode, shutdown, restart",
+            ),
+        ];
+        for (tile, expected) in cases {
+            let loaded = serde_json::from_str::<Tile>(tile);
+            let located = problem(&format!(r#"{{ "tiles": [ {tile} ] }}"#));
+            assert!(loaded.is_err(), "{tile}");
+            assert!(located.contains(expected), "{located}");
+        }
+        for ok in [
+            r#"{ "name": "A", "desktop": "a.desktop" }"#,
+            r#"{ "name": "A", "flatpak": "a.A" }"#,
+            r#"{ "name": "A", "icon": "a", "command": "x" }"#,
+        ] {
+            assert!(serde_json::from_str::<Tile>(ok).is_ok(), "{ok}");
+            assert!(Config::parse(&format!(r#"{{ "tiles": [ {ok} ] }}"#)).is_ok());
         }
     }
 

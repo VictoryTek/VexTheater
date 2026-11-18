@@ -119,13 +119,13 @@ The following source-medium issues are raised to high **scheduling** priority to
 
 ### Batch 12 — Unify configuration validation knowledge · M
 
-- [ ] **ARCH-04 — Produce structured field errors from shared validation.** Centralize action metadata and semantic checks so error formatting consumes their results rather than maintaining a second schema in `locate*`. Evidence: [config.rs:164](C:/Projects/VexTheater/src/config.rs:164), lines 164–168 and 223–346. Preserve strict acceptance rules, null handling, and precise field paths; no current schema disagreement is asserted.
+- [x] **ARCH-04 — Produce structured field errors from shared validation.** Centralize action metadata and semantic checks so error formatting consumes their results rather than maintaining a second schema in `locate*`. Evidence: [config.rs:164](C:/Projects/VexTheater/src/config.rs:164), lines 164–168 and 223–346. Preserve strict acceptance rules, null handling, and precise field paths; no current schema disagreement is asserted.
 
 **Done when:** Existing strict-schema tests still pass, and rule changes cannot require independent updates to two semantic validators. Keep the external configuration contract unchanged; a new schema feature would require separate coordinated work with the consumer.
 
 ### Batch 13 — Browse/filter the visible tile graph · M
 
-- [ ] **FEAT-07 — Add Browse all with local metadata filtering.** Build results from visible, reachable app tiles, retain original page/identity and duplicate-name context, use a visited-page set for cycles, and support keyboard filtering plus remote alphabet groups. Evidence: [config.rs:187](C:/Projects/VexTheater/src/config.rs:187), [tiles.rs:123](C:/Projects/VexTheater/src/tiles.rs:123), [window.rs:2321](C:/Projects/VexTheater/src/window.rs:2321), and [grid.rs:29](C:/Projects/VexTheater/src/grid.rs:29).
+- [ ] **FEAT-07 — Add Browse all with local metadata filtering.** *(Revisit ARCH-01 stages 2 and 3 here: skipped for now by the owner; if Browse all shows the model needs to own the shown order or the lifecycle state, do them then.)* Build results from visible, reachable app tiles, retain original page/identity and duplicate-name context, use a visited-page set for cycles, and support keyboard filtering plus remote alphabet groups. Evidence: [config.rs:187](C:/Projects/VexTheater/src/config.rs:187), [tiles.rs:123](C:/Projects/VexTheater/src/tiles.rs:123), [window.rs:2321](C:/Projects/VexTheater/src/window.rs:2321), and [grid.rs:29](C:/Projects/VexTheater/src/grid.rs:29).
 
 **Done when:** Nested/cyclic submenus, hidden openers, duplicate names, missing apps, empty results, and Back/focus restoration behave correctly; filtering never mutates saved order or unhides tiles. Reuse Batch 11's model if available, but do not force the full extraction merely to ship this optional view. Search tile metadata, not remote streaming catalogs.
 
