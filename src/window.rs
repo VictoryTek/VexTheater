@@ -80,6 +80,19 @@ impl Command {
             | Command::Inert => true,
         }
     }
+
+    /// What starts when a tile with this command is chosen, if it starts an app: not a
+    /// submenu, a power or desktop-mode action, or one of the launcher's own pages.
+    fn app_kind(&self) -> Option<&'static str> {
+        match self {
+            Command::Config(Action::Command(_)) => Some("command"),
+            Command::Config(Action::Desktop(_)) => Some("desktop"),
+            Command::Config(Action::Flatpak(_)) => Some("flatpak"),
+            Command::Service(app) if app.flatpak.is_some() => Some("flatpak"),
+            Command::Service(_) => Some("web"),
+            _ => None,
+        }
+    }
 }
 
 /// A tile as the launcher shows it: one from the configuration, or one of its own pages.
@@ -279,6 +292,28 @@ pub fn command_line(
             });
             glib::ExitCode::SUCCESS
         }
+        // Chooses a tile as pressing it does. The exit status says whether the launcher
+        // accepted the request, not whether the app then starts.
+        [flag, page, name, rest @ ..]
+            if flag == "--launch"
+                && rest.len() <= 1
+                && rest
+                    .iter()
+                    .all(|nth| nth.parse::<usize>().is_ok_and(|nth| nth > 0)) =>
+        {
+            let nth = rest.first().map_or(1, |nth| nth.parse().unwrap_or(1));
+            let result = match ui(application) {
+                Some(ui) => ui.launch_tile(page, name, nth),
+                None => Err("the configuration cannot be read, so there are no tiles".to_owned()),
+            };
+            match result {
+                Ok(()) => glib::ExitCode::SUCCESS,
+                Err(error) => {
+                    command_line.printerr_literal(&format!("vextheater: {error}\n"));
+                    glib::ExitCode::from(1)
+                }
+            }
+        }
         [flag] if flag == "--reload" => {
             if let Some(ui) = ui(application) {
                 ui.reload(true);
@@ -299,15 +334,19 @@ pub fn command_line(
         }
         _ => {
             command_line.printerr_literal(
-                "usage: vextheater [--home | --desktop | --toggle | --reload | --diagnose | --resume | --check-config [FILE] | --print-order]\n  \
+                "usage: vextheater [--home | --desktop | --toggle | --reload | --diagnose | --resume | --launch PAGE NAME [N] | --check-config [FILE] | --print-order | --list-tiles | --export-layout [FILE] | --import-layout FILE [--apply]]\n  \
                  --home    close the open app and show the launcher\n  \
                  --desktop hide the launcher and show the GNOME desktop\n  \
                  --toggle  show the launcher if it is hidden, else hide it\n  \
                  --reload  read the configuration again and rebuild the tiles\n  \
                  --diagnose  check what the launcher needs from its session\n  \
                  --resume  show the launcher, unless it crashed in desktop mode\n  \
+                 --launch PAGE NAME [N]  choose the Nth (default 1) tile of that name on a page, main or submenu:NAME\n  \
                  --check-config [FILE]  check a configuration file and exit (first argument)\n  \
-                 --print-order  print the tiles in the order shown and exit (first argument)\n",
+                 --print-order  print the tiles in the order shown and exit (first argument)\n  \
+                 --list-tiles  print the tiles that start an app, as JSON, and exit (first argument)\n  \
+                 --export-layout [FILE]  save the added, removed and ordered tiles as a bundle (first argument)\n  \
+                 --import-layout FILE [--apply]  check a bundle, or with --apply restore it (first argument)\n",
             );
             glib::ExitCode::from(2)
         }
@@ -354,6 +393,94 @@ pub fn order_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles
         }
     }
     listing
+}
+
+/// The tiles that start an app, as JSON for scripts: each shown tile of the main row and
+/// of the submenus, in the order the launcher shows them, with its page, name,
+/// occurrence (which one of that name it is on the page, from 1, as `--launch` takes it)
+/// and kind of app. Removed tiles, submenus and power actions are not in it.
+pub fn tile_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles::Shown) -> String {
+    let main = (Page::Main.key(), main_entries(config, shown));
+    let submenus = submenu_entries(config)
+        .into_iter()
+        .map(|(name, entries)| (Page::Submenu(name).key(), entries));
+    let mut listing = Vec::new();
+    for (key, entries) in std::iter::once(main).chain(submenus) {
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        let identities = order::identities(&names);
+        for index in tiles::visible(&key, &names, shown, saved.get(&key)) {
+            if let Some(kind) = entries[index].command.app_kind() {
+                listing.push(serde_json::json!({
+                    "page": key,
+                    "name": names[index],
+                    "occurrence": identities[index].1 + 1,
+                    "kind": kind,
+                }));
+            }
+        }
+    }
+    let mut text = serde_json::to_string_pretty(&listing).expect("a listing is plain data");
+    text.push('\n');
+    text
+}
+
+/// The configured main-row tiles that lead to the submenu `target`, directly or through
+/// other submenus, as indexes into the main row.
+fn main_openers(config: &Config, target: &str) -> Vec<usize> {
+    fn leads_to<'a>(
+        config: &'a Config,
+        action: &'a Action,
+        target: &str,
+        seen: &mut Vec<&'a str>,
+    ) -> bool {
+        let Action::Submenu(name) = action else {
+            return false;
+        };
+        if name == target {
+            return true;
+        }
+        if seen.contains(&name.as_str()) {
+            return false;
+        }
+        seen.push(name);
+        config.submenus.get(name).is_some_and(|tiles| {
+            tiles
+                .iter()
+                .any(|tile| leads_to(config, &tile.action, target, seen))
+        })
+    }
+    config
+        .tiles
+        .iter()
+        .enumerate()
+        .filter(|(_, tile)| leads_to(config, &tile.action, target, &mut Vec::new()))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The index in `entries` of the `nth` (from 1) tile called `name`, which must be one of
+/// the `visible` tiles and start an app, or why not. Tiles are told apart as the saved
+/// order does (`order::identities`), so the occurrence does not change when a tile of
+/// that name is removed.
+fn resolve_tile(
+    entries: &[Entry],
+    visible: &[usize],
+    name: &str,
+    nth: usize,
+) -> Result<usize, String> {
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    let wanted = (name.to_owned(), nth.saturating_sub(1));
+    let index = order::identities(&names)
+        .iter()
+        .position(|identity| *identity == wanted)
+        .ok_or_else(|| format!("no tile \"{name}\" (#{nth}) on that page"))?;
+    if !visible.contains(&index) {
+        return Err(format!("\"{name}\" (#{nth}) was removed from that page"));
+    }
+    if entries[index].command.app_kind().is_none() {
+        return Err(format!("\"{name}\" does not start an app"));
+    }
+    Ok(index)
 }
 
 /// Shows the launcher (theater mode), e.g. from "Theater Mode" in the app grid.
@@ -1920,6 +2047,57 @@ impl Ui {
         Ok(())
     }
 
+    /// Chooses a tile as pressing it does, for `--launch`: the `nth` (from 1) tile called
+    /// `name` on the page `key` (`main` or `submenu:NAME`), which must be on that page
+    /// now and start an app. Success means the request was accepted, not that the app
+    /// has started. Nothing is closed for a tile that is refused.
+    fn launch_tile(self: &Rc<Self>, key: &str, name: &str, nth: usize) -> Result<(), String> {
+        let page = Page::from_key(key).ok_or_else(|| {
+            format!("\"{key}\" is not a page of tiles (use main or submenu:NAME)")
+        })?;
+        let entries = match &page {
+            Page::Main => self.main.borrow().clone(),
+            Page::Submenu(submenu) => self
+                .submenus
+                .borrow()
+                .get(submenu)
+                .cloned()
+                .ok_or_else(|| format!("there is no submenu \"{submenu}\""))?,
+            _ => return Err(format!("\"{key}\" is not a page of tiles")),
+        };
+        let buttons = self
+            .arrangeable
+            .borrow()
+            .get(&page)
+            .map(|tiles| tiles.buttons.clone())
+            .ok_or_else(|| format!("\"{key}\" is not a page of tiles"))?;
+        let visible: Vec<usize> = buttons.iter().map(|(index, _)| *index).collect();
+        let index = resolve_tile(&entries, &visible, name, nth)?;
+        let entry = &entries[index];
+        if !self.installed(&entry.command) {
+            return Err(format!("{} isn't installed", entry.name));
+        }
+        let (_, button) = buttons
+            .iter()
+            .find(|(shown, _)| *shown == index)
+            .ok_or_else(|| format!("\"{name}\" is not shown"))?;
+        self.activate(&page, entry, button);
+        if let Page::Submenu(submenu) = &page {
+            // `activate` took the origin from the pages that happen to be open; for a
+            // tile chosen from outside it is the main-row tile that leads to the submenu.
+            let arranged = self.arrangeable.borrow();
+            let openers = main_openers(&self.config.borrow(), submenu);
+            let origin = arranged.get(&Page::Main).and_then(|main| {
+                main.buttons
+                    .iter()
+                    .find(|(shown, _)| openers.contains(shown))
+                    .map(|(_, button)| button.downgrade())
+            });
+            self.origin.replace(origin);
+        }
+        Ok(())
+    }
+
     /// One app at a time: the previous one is closed, and the new one starts once it
     /// is gone. A tile chosen while that is pending replaces the pending one.
     fn launch(self: &Rc<Self>, name: &str, action: &Action) {
@@ -2913,8 +3091,9 @@ fn show_selected(name: &gtk::Label, description: &gtk::Label, tile: &Entry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        closing_text, health_entries, is_back, is_enter, is_navigation, is_settings, order_listing,
-        own_pages, CloseQueue, Command, Confirmable, Page, Request,
+        closing_text, health_entries, is_back, is_enter, is_navigation, is_settings, main_openers,
+        order_listing, own_pages, resolve_tile, tile_listing, CloseQueue, Command, Confirmable,
+        Entry, Page, Request,
     };
     use crate::config::{Action, Builtin};
     use gtk::gdk::Key;
@@ -3115,6 +3294,161 @@ mod tests {
             ),
             "main:\n  1. A\n  2. B\n  3. Games\n  4. New\nsubmenu Games:\n  1. X\n  2. Y\n"
         );
+    }
+
+    fn app(name: &str) -> Entry {
+        Entry {
+            name: name.to_owned(),
+            icon: None,
+            description: None,
+            command: Command::Config(Action::Command(name.to_lowercase())),
+        }
+    }
+
+    fn other(name: &str, action: Action) -> Entry {
+        Entry {
+            command: Command::Config(action),
+            ..app(name)
+        }
+    }
+
+    #[test]
+    fn a_tile_is_found_by_name_and_occurrence() {
+        let entries = [app("Browser"), app("Files"), app("Browser")];
+        let all = [0, 1, 2];
+        assert_eq!(resolve_tile(&entries, &all, "Browser", 1), Ok(0));
+        assert_eq!(resolve_tile(&entries, &all, "Browser", 2), Ok(2));
+        assert_eq!(resolve_tile(&entries, &all, "Files", 1), Ok(1));
+        for (name, nth) in [("Browser", 3), ("Files", 2), ("Nothing", 1), ("browser", 1)] {
+            let error = resolve_tile(&entries, &all, name, nth).unwrap_err();
+            assert!(error.contains("no tile"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_removed_tile_is_refused_and_does_not_shift_the_others() {
+        // The first "Browser" was removed: the second is still the second.
+        let entries = [app("Browser"), app("Files"), app("Browser")];
+        let visible = [1, 2];
+        let error = resolve_tile(&entries, &visible, "Browser", 1).unwrap_err();
+        assert!(error.contains("was removed"), "{error}");
+        assert_eq!(resolve_tile(&entries, &visible, "Browser", 2), Ok(2));
+    }
+
+    #[test]
+    fn only_a_tile_that_starts_an_app_can_be_chosen() {
+        let entries = [
+            other("Games", Action::Submenu("Games".into())),
+            other("Desktop", Action::Builtin(Builtin::DesktopMode)),
+            other("Off", Action::Builtin(Builtin::Shutdown)),
+            other("Restart", Action::Builtin(Builtin::Restart)),
+            other("Kodi", Action::Desktop("kodi.desktop".into())),
+            other("Plex", Action::Flatpak("tv.plex.PlexHTPC".into())),
+            app("Files"),
+        ];
+        let all: Vec<usize> = (0..entries.len()).collect();
+        for name in ["Games", "Desktop", "Off", "Restart"] {
+            let error = resolve_tile(&entries, &all, name, 1).unwrap_err();
+            assert!(error.contains("does not start an app"), "{error}");
+        }
+        for name in ["Kodi", "Plex", "Files"] {
+            assert!(resolve_tile(&entries, &all, name, 1).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_tile_listing_has_the_shown_app_tiles_in_order_with_their_occurrence() {
+        let config = crate::config::Config::parse(
+            r#"{ "tiles": [
+                    { "name": "Browser", "icon": "b", "command": "one" },
+                    { "name": "Files", "icon": "f", "desktop": "files.desktop" },
+                    { "name": "Browser", "icon": "b", "command": "two" },
+                    { "name": "Games", "icon": "g", "submenu": "Games" },
+                    { "name": "Off", "icon": "o", "builtin": "shutdown" } ],
+                "submenus": { "Games": [
+                    { "name": "X", "icon": "x", "flatpak": "org.x.X" },
+                    { "name": "Y", "icon": "y", "command": "y" } ] } }"#,
+        )
+        .unwrap();
+        // "Files" first, then the second "Browser", the first removed; "Y" before "X".
+        let saved: crate::order::Saved = serde_json::from_str(
+            r#"{"main":[["Files",0],["Browser",1]],"submenu:Games":[["Y",0],["X",0]]}"#,
+        )
+        .unwrap();
+        let shown = crate::tiles::Shown {
+            added: vec![],
+            hidden: std::collections::BTreeMap::from([(
+                "main".to_owned(),
+                vec![("Browser".to_owned(), 0)],
+            )]),
+        };
+        let listing: serde_json::Value =
+            serde_json::from_str(&tile_listing(&config, &saved, &shown)).unwrap();
+        assert_eq!(
+            listing,
+            serde_json::json!([
+                { "page": "main", "name": "Files", "occurrence": 1, "kind": "desktop" },
+                { "page": "main", "name": "Browser", "occurrence": 2, "kind": "command" },
+                { "page": "submenu:Games", "name": "Y", "occurrence": 1, "kind": "command" },
+                { "page": "submenu:Games", "name": "X", "occurrence": 1, "kind": "flatpak" },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_submenu_is_reached_from_the_main_row_tiles_that_lead_to_it() {
+        let config = crate::config::Config::parse(
+            r#"{ "tiles": [
+                    { "name": "Media", "icon": "m", "submenu": "Media" },
+                    { "name": "Games", "icon": "g", "submenu": "Games" },
+                    { "name": "Misc", "icon": "x", "submenu": "Misc" },
+                    { "name": "Files", "icon": "f", "command": "files" } ],
+                "submenus": {
+                    "Media": [ { "name": "More", "icon": "m", "submenu": "Games" } ],
+                    "Games": [ { "name": "X", "icon": "x", "command": "x" } ],
+                    "Misc": [ { "name": "Loop", "icon": "l", "submenu": "Misc" },
+                              { "name": "Y", "icon": "y", "command": "y" } ] } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            main_openers(&config, "Games"),
+            [0, 1],
+            "directly and through Media"
+        );
+        assert_eq!(main_openers(&config, "Media"), [0]);
+        assert_eq!(
+            main_openers(&config, "Misc"),
+            [2],
+            "a submenu that opens itself ends"
+        );
+        assert_eq!(main_openers(&config, "Nothing"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn an_added_service_is_listed_as_the_app_it_opens() {
+        let config = crate::config::Config::parse(r#"{ "tiles": [] }"#).unwrap();
+        let shown = crate::tiles::Shown {
+            added: crate::catalog::APPS
+                .iter()
+                .map(|app| app.id.to_owned())
+                .collect(),
+            hidden: Default::default(),
+        };
+        let listing: Vec<serde_json::Value> =
+            serde_json::from_str(&tile_listing(&config, &crate::order::Saved::new(), &shown))
+                .unwrap();
+        assert_eq!(listing.len(), crate::catalog::APPS.len());
+        for (entry, app) in listing.iter().zip(crate::catalog::APPS) {
+            assert_eq!(entry["name"], app.name);
+            assert_eq!(
+                entry["kind"],
+                if app.flatpak.is_some() {
+                    "flatpak"
+                } else {
+                    "web"
+                }
+            );
+        }
     }
 
     // The launcher adds exactly one page for the power menu and for each confirmation,

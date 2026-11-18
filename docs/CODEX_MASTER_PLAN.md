@@ -105,7 +105,7 @@ The following source-medium issues are raised to high **scheduling** priority to
 
 ### Batch 10 — Activate existing tiles from local automation · M
 
-- [ ] **FEAT-06 — Add forwarded tile launch and a machine-readable listing.** Resolve page/name/occurrence selectors to visible app tiles and reuse click behavior: availability check, origin tracking, webapp preparation, and the same close queue. Evidence: [main.rs:47](C:/Projects/VexTheater/src/main.rs:47), [window.rs:198](C:/Projects/VexTheater/src/window.rs:198), lines 198–275 and 1648–1793; [order.rs:10](C:/Projects/VexTheater/src/order.rs:10). Reject stale/hidden selectors, submenu targets, and power actions.
+- [x] **FEAT-06 — Add forwarded tile launch and a machine-readable listing.** Resolve page/name/occurrence selectors to visible app tiles and reuse click behavior: availability check, origin tracking, webapp preparation, and the same close queue. Evidence: [main.rs:47](C:/Projects/VexTheater/src/main.rs:47), [window.rs:198](C:/Projects/VexTheater/src/window.rs:198), lines 198–275 and 1648–1793; [order.rs:10](C:/Projects/VexTheater/src/order.rs:10). Reject stale/hidden selectors, submenu targets, and power actions.
 
 **Done when:** Requests reach the running instance, rapid commands obey latest-request-wins, and invalid/missing apps leave the current app running. Success means acceptance, not guaranteed later launch success. Selectors are tied to the current identity convention and are not promised to survive renaming. Depends on Batches 2 and 4; adds no network listener or unrestricted command executor.
 

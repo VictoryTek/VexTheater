@@ -260,6 +260,23 @@ offered because neither collection has their logos.
   - `vextheater --desktop` hides the launcher like Desktop Mode, and `vextheater
     --toggle` shows it when it is hidden and hides it when it is shown, so one key can
     switch between theater and desktop mode.
+  - `vextheater --launch PAGE NAME [N]` chooses a tile the way pressing it does, from
+    a script or another program: the same installed check, the same close of the open
+    app first, and the same rule that a tile chosen while a close runs replaces the
+    pending one, so only the latest of several quick commands starts. `PAGE` is `main`
+    or `submenu:NAME`; `NAME` is the tile's name, and `N` (from 1, default 1) says which
+    when several share it, counted as `--list-tiles` shows and unchanged when an earlier
+    one is removed. It is refused, with a message on standard error, exit status 1 and
+    nothing closed, for a tile that is not there, was removed, is not an app (a submenu,
+    Desktop Mode, power), or whose app is not installed; a bad command line is 2. A
+    status of 0 means the launcher accepted the request, not that the app then started.
+    It chooses only tiles the launcher shows, so it cannot run anything that is not
+    one of them, and there is no listener besides the launcher's own session service.
+    If the launcher is not running it is started, as `--home` does.
+    `vextheater --list-tiles` prints those tiles as JSON, in the order shown with the
+    saved arrangement, added services and removed tiles applied: for each, its `page`,
+    `name`, `occurrence`, and `kind` (`command`, `desktop`, `flatpak` or `web`). It
+    needs no display and no running launcher.
   - `vextheater --reload` reads the configuration again and rebuilds the tiles, titles
     and background in the running launcher, which is also done whenever the launcher
     is shown again and the file has changed. The open app, a close in progress and the

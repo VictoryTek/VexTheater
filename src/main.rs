@@ -39,6 +39,9 @@ fn main() -> glib::ExitCode {
     {
         std::process::exit(print_order(&arguments[1..]));
     }
+    if arguments.first().is_some_and(|flag| flag == "--list-tiles") {
+        std::process::exit(list_tiles(&arguments[1..]));
+    }
     if arguments
         .first()
         .is_some_and(|flag| flag == "--export-layout")
@@ -124,6 +127,29 @@ fn print_order(extra: &[String]) -> i32 {
         Ok(config) => {
             let listing = window::order_listing(&config, &order::load(), &tiles::Shown::load());
             print!("{listing}");
+            0
+        }
+        Err(error) => {
+            eprintln!("vextheater: {error:#}");
+            1
+        }
+    }
+}
+
+/// `--list-tiles`: prints the tiles that start an app as JSON, for scripts that choose
+/// one with `--launch`. Needs no display and no running launcher; it is what
+/// `--print-order` shows, less the tiles that are not apps.
+fn list_tiles(extra: &[String]) -> i32 {
+    if !extra.is_empty() {
+        eprintln!("usage: vextheater --list-tiles");
+        return 2;
+    }
+    match config::Config::load_default() {
+        Ok(config) => {
+            print!(
+                "{}",
+                window::tile_listing(&config, &order::load(), &tiles::Shown::load())
+            );
             0
         }
         Err(error) => {
