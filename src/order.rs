@@ -14,7 +14,7 @@ pub type Identity = (String, usize);
 /// Tile identities in their arranged order, by page.
 pub type Saved = BTreeMap<String, Vec<Identity>>;
 
-fn file() -> PathBuf {
+pub fn file() -> PathBuf {
     files::state_file("order.json")
 }
 

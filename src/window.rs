@@ -314,6 +314,20 @@ pub fn command_line(
     }
 }
 
+/// The page key and configured tile names of every page of `config`, the main row first.
+pub fn page_names(config: &Config) -> Vec<(String, Vec<String>)> {
+    let names =
+        |tiles: &[crate::config::Tile]| tiles.iter().map(|tile| tile.name.clone()).collect();
+    std::iter::once((Page::Main.key(), names(&config.tiles)))
+        .chain(
+            config
+                .submenus
+                .iter()
+                .map(|(name, tiles)| (Page::Submenu(name.clone()).key(), names(tiles))),
+        )
+        .collect()
+}
+
 /// The tiles of the main row and of each submenu, in the order the launcher shows them:
 /// the arrangement in `saved` over the configured order, with the services that were
 /// added and without the tiles that were removed (`shown`). One page per heading, one

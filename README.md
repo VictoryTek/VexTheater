@@ -164,6 +164,23 @@ arrangement over the configured order, with the services added and without the t
 removed, and without a display), to see what the files do or that a configuration change
 moved a tile.
 
+**Export and restore.** `vextheater --export-layout [FILE]` writes the layout you made (the
+services added, the configured tiles removed, and the order of each page) as one versioned
+JSON bundle, to FILE or to standard output. `vextheater --import-layout FILE` reads a
+bundle and only says what restoring it would do: how many services, removals and orders it
+holds, which entries match no tile of the current configuration, which tiles were
+configured since the export or are gone now, and whether it differs from your current
+layout. Add `--apply` to restore it. Neither needs a display. A file that is not valid
+JSON, not a layout bundle, of another version, or that names an unknown service is
+rejected before anything is changed. `--apply` first saves your current layout as a bundle
+in `~/.local/state/vextheater/previous-layout.json`, then writes `tiles.json` and
+`order.json`. The two writes are each atomic but not one transaction: if the second fails,
+the first file is put back and the message says so. It refuses to apply while the launcher
+is running, since the launcher would write its own layout over the restored one (quit it
+first); if the session bus cannot be reached it warns and goes on. Browser profiles,
+running-app and mode records, GNOME snapshots and the system configuration are not in a
+bundle.
+
 **Upgrading:** the Desktop Mode and Power tiles used to come from the configuration (the
 vexos-nix HTPC module sent them). The button replaces them, so the launcher leaves out of
 the main row any tile with a `desktop-mode`, `shutdown` or `restart` builtin, and any tile

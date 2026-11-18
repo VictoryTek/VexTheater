@@ -24,7 +24,7 @@ pub struct Shown {
     pub hidden: BTreeMap<String, Vec<Identity>>,
 }
 
-fn file() -> PathBuf {
+pub fn file() -> PathBuf {
     files::state_file("tiles.json")
 }
 

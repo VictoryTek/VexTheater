@@ -1,5 +1,6 @@
 //! VexTheater — a full-screen TV launcher for GNOME.
 
+mod bundle;
 mod catalog;
 mod clock;
 mod config;
@@ -37,6 +38,18 @@ fn main() -> glib::ExitCode {
         .is_some_and(|flag| flag == "--print-order")
     {
         std::process::exit(print_order(&arguments[1..]));
+    }
+    if arguments
+        .first()
+        .is_some_and(|flag| flag == "--export-layout")
+    {
+        std::process::exit(export_layout(&arguments[1..]));
+    }
+    if arguments
+        .first()
+        .is_some_and(|flag| flag == "--import-layout")
+    {
+        std::process::exit(import_layout(&arguments[1..]));
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -117,6 +130,107 @@ fn print_order(extra: &[String]) -> i32 {
             eprintln!("vextheater: {error:#}");
             1
         }
+    }
+}
+
+/// `--export-layout [FILE]`: writes the layout the user made (tiles added and removed,
+/// and the order of each page) as a bundle to FILE, or to standard output. Needs no
+/// display.
+fn export_layout(arguments: &[String]) -> i32 {
+    let file = match arguments {
+        [] => None,
+        [file] => Some(file),
+        _ => {
+            eprintln!("usage: vextheater --export-layout [FILE]");
+            return 2;
+        }
+    };
+    let config = match config::Config::load_default() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("vextheater: {error:#}");
+            return 1;
+        }
+    };
+    let (shown, saved) = bundle::Targets::user().load();
+    let text = bundle::Bundle::capture(&window::page_names(&config), &shown, &saved).to_text();
+    match file {
+        None => {
+            print!("{text}");
+            0
+        }
+        Some(file) => match files::write_atomic(std::path::Path::new(file), text.as_bytes()) {
+            Ok(()) => {
+                println!("{file}: layout exported");
+                0
+            }
+            Err(error) => {
+                eprintln!("vextheater: cannot write {file}: {error}");
+                1
+            }
+        },
+    }
+}
+
+/// `--import-layout FILE [--apply]`: checks a bundle and says what restoring it would
+/// do, against the configuration and the current layout. Changes nothing unless
+/// `--apply` is given, and then not while the launcher is running, which would write its
+/// own layout over the restored one. Needs no display.
+fn import_layout(arguments: &[String]) -> i32 {
+    let usage = "usage: vextheater --import-layout FILE [--apply]";
+    let apply = arguments.iter().any(|argument| argument == "--apply");
+    let mut paths = arguments.iter().filter(|argument| *argument != "--apply");
+    let (Some(file), None) = (paths.next(), paths.next()) else {
+        eprintln!("{usage}");
+        return 2;
+    };
+    let fail = |message: String| {
+        eprintln!("vextheater: {message}");
+        1
+    };
+
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) => return fail(format!("cannot read {file}: {error}")),
+    };
+    let bundle = match bundle::Bundle::parse(&text) {
+        Ok(bundle) => bundle,
+        Err(error) => return fail(format!("{file}: {error}")),
+    };
+    let config = match config::Config::load_default() {
+        Ok(config) => config,
+        Err(error) => return fail(format!("{error:#}")),
+    };
+    let pages = window::page_names(&config);
+    let targets = bundle::Targets::user();
+    let (shown, saved) = targets.load();
+    print!("{}", bundle::preview(&bundle, &pages, (&shown, &saved)));
+    if !apply {
+        println!("Nothing was changed. Run it again with --apply to restore this layout.");
+        return 0;
+    }
+
+    match bundle::launcher_running() {
+        Ok(true) => {
+            return fail(
+                "the launcher is running; quit it first, or it would overwrite the restored layout"
+                    .to_owned(),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("vextheater: warning: cannot tell whether the launcher is running ({error})")
+        }
+    }
+    match bundle::apply(&bundle, &pages, &targets) {
+        Ok(()) => {
+            println!(
+                "Layout restored. Your previous layout is in {}.",
+                targets.previous.display()
+            );
+            0
+        }
+        Err(error) => fail(error),
     }
 }
 

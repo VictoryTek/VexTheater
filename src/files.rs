@@ -55,6 +55,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_file(path, bytes, |file, bytes| file.write_all(bytes))
 }
 
+/// The directory holding `path`: the current one for a bare file name, whose parent is
+/// the empty path, which cannot be opened.
+fn directory_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// Writes `bytes` to a temporary file beside `path` through `write` (which tests
 /// replace to simulate a crash part way through), renames it over `path`, then syncs
 /// the directory so the rename itself survives a power cut.
@@ -63,7 +71,7 @@ fn write_file(
     bytes: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = directory_of(path);
     std::fs::create_dir_all(dir)?;
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
@@ -148,6 +156,13 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err(), "{result:?}");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_bare_file_name_is_in_the_current_directory() {
+        assert_eq!(directory_of(Path::new("layout.json")), Path::new("."));
+        assert_eq!(directory_of(Path::new("out/layout.json")), Path::new("out"));
+        assert_eq!(directory_of(Path::new("/layout.json")), Path::new("/"));
     }
 
     #[test]
