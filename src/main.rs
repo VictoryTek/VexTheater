@@ -11,6 +11,7 @@ mod grid;
 mod keybinding;
 mod launch;
 mod mode;
+mod model;
 mod order;
 mod sound;
 mod tiles;
@@ -179,7 +180,7 @@ fn export_layout(arguments: &[String]) -> i32 {
         }
     };
     let (shown, saved) = bundle::Targets::user().load();
-    let text = bundle::Bundle::capture(&window::page_names(&config), &shown, &saved).to_text();
+    let text = bundle::Bundle::capture(&model::configured_names(&config), &shown, &saved).to_text();
     match file {
         None => {
             print!("{text}");
@@ -227,7 +228,7 @@ fn import_layout(arguments: &[String]) -> i32 {
         Ok(config) => config,
         Err(error) => return fail(format!("{error:#}")),
     };
-    let pages = window::page_names(&config);
+    let pages = model::configured_names(&config);
     let targets = bundle::Targets::user();
     let (shown, saved) = targets.load();
     print!("{}", bundle::preview(&bundle, &pages, (&shown, &saved)));

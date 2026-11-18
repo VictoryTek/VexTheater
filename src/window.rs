@@ -186,7 +186,7 @@ impl Page {
     const ADD: &'static str = "add";
     const TILE_OPTIONS: &'static str = "options";
     const HEALTH: &'static str = "health";
-    const SUBMENU_PREFIX: &'static str = "submenu:";
+    const SUBMENU_PREFIX: &'static str = crate::model::SUBMENU_PREFIX;
     const CONFIRM_PREFIX: &'static str = "confirm:";
 
     fn key(&self) -> String {
@@ -353,46 +353,28 @@ pub fn command_line(
     }
 }
 
-/// The page key and configured tile names of every page of `config`, the main row first.
-pub fn page_names(config: &Config) -> Vec<(String, Vec<String>)> {
-    let names =
-        |tiles: &[crate::config::Tile]| tiles.iter().map(|tile| tile.name.clone()).collect();
-    std::iter::once((Page::Main.key(), names(&config.tiles)))
-        .chain(
-            config
-                .submenus
-                .iter()
-                .map(|(name, tiles)| (Page::Submenu(name.clone()).key(), names(tiles))),
-        )
-        .collect()
-}
-
 /// The tiles of the main row and of each submenu, in the order the launcher shows them:
 /// the arrangement in `saved` over the configured order, with the services that were
 /// added and without the tiles that were removed (`shown`). One page per heading, one
 /// tile per line.
 pub fn order_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles::Shown) -> String {
     let mut listing = String::new();
-    let main = (Page::Main, "main".to_owned(), &config.tiles);
-    let submenus = config.submenus.iter().map(|(name, tiles)| {
-        (
-            Page::Submenu(name.clone()),
-            format!("submenu {name}"),
-            tiles,
-        )
-    });
-    for (page, heading, page_tiles) in std::iter::once(main).chain(submenus) {
-        let configured: Vec<&str> = page_tiles.iter().map(|tile| tile.name.as_str()).collect();
-        let key = page.key();
-        let listed = tiles::listed(&key, &configured, shown);
-        let names: Vec<&str> = listed.iter().map(|(_, name)| name.as_str()).collect();
-        let order = tiles::visible(&key, &names, shown, saved.get(&key));
+    for page in crate::model::pages(config, shown) {
+        let heading = match page.key().strip_prefix(crate::model::SUBMENU_PREFIX) {
+            Some(name) => format!("submenu {name}"),
+            None => page.key().to_owned(),
+        };
         listing.push_str(&format!("{heading}:\n"));
-        for (position, index) in order.into_iter().enumerate() {
-            listing.push_str(&format!("  {}. {}\n", position + 1, names[index]));
+        for (position, index) in page.shown(shown, saved).into_iter().enumerate() {
+            listing.push_str(&format!("  {}. {}\n", position + 1, page.names()[index]));
         }
     }
     listing
+}
+
+/// The page `key` whose list of tiles is `entries`.
+fn entry_page(key: &str, entries: &[Entry]) -> crate::model::PageModel {
+    crate::model::PageModel::from_names(key, entries.iter().map(|e| e.name.clone()).collect())
 }
 
 /// The tiles that start an app, as JSON for scripts: each shown tile of the main row and
@@ -406,14 +388,13 @@ pub fn tile_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles:
         .map(|(name, entries)| (Page::Submenu(name).key(), entries));
     let mut listing = Vec::new();
     for (key, entries) in std::iter::once(main).chain(submenus) {
-        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        let identities = order::identities(&names);
-        for index in tiles::visible(&key, &names, shown, saved.get(&key)) {
+        let page = entry_page(&key, &entries);
+        for index in page.shown(shown, saved) {
             if let Some(kind) = entries[index].command.app_kind() {
                 listing.push(serde_json::json!({
                     "page": key,
-                    "name": names[index],
-                    "occurrence": identities[index].1 + 1,
+                    "name": page.names()[index],
+                    "occurrence": page.identities()[index].1 + 1,
                     "kind": kind,
                 }));
             }
@@ -468,11 +449,9 @@ fn resolve_tile(
     name: &str,
     nth: usize,
 ) -> Result<usize, String> {
-    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
     let wanted = (name.to_owned(), nth.saturating_sub(1));
-    let index = order::identities(&names)
-        .iter()
-        .position(|identity| *identity == wanted)
+    let index = entry_page("", entries)
+        .index_of(&wanted)
         .ok_or_else(|| format!("no tile \"{name}\" (#{nth}) on that page"))?;
     if !visible.contains(&index) {
         return Err(format!("\"{name}\" (#{nth}) was removed from that page"));
@@ -1319,13 +1298,7 @@ impl Ui {
         column.append(row.widget());
 
         let positions: Vec<usize> = if arrangeable {
-            let names: Vec<&str> = tiles.iter().map(|tile| tile.name.as_str()).collect();
-            tiles::visible(
-                &page.key(),
-                &names,
-                &self.shown.borrow(),
-                self.saved_order.borrow().get(&page.key()),
-            )
+            entry_page(&page.key(), tiles).shown(&self.shown.borrow(), &self.saved_order.borrow())
         } else {
             (0..tiles.len()).collect()
         };
@@ -1717,9 +1690,9 @@ impl Ui {
         self.update_arrange_hint();
     }
 
-    /// The names of a page's tiles in its list, which every index of the page refers to.
-    fn listed_names(&self, page: &Page) -> Vec<String> {
-        match page {
+    /// A page's list of tiles, which every index of the page refers to.
+    fn page_model(&self, page: &Page) -> crate::model::PageModel {
+        let names = match page {
             Page::Main => self.main.borrow().iter().map(|e| e.name.clone()).collect(),
             Page::Submenu(name) => self
                 .submenus
@@ -1728,15 +1701,14 @@ impl Ui {
                 .map(|tiles| tiles.iter().map(|e| e.name.clone()).collect())
                 .unwrap_or_default(),
             _ => Vec::new(),
-        }
+        };
+        crate::model::PageModel::from_names(&page.key(), names)
     }
 
     /// The tile order of the page, as the row shows it now; the tiles that were removed
     /// keep the places they had.
     fn save_order(&self, page: &Page) {
-        let names = self.listed_names(page);
-        let configured: Vec<&str> = names.iter().map(String::as_str).collect();
-        let identities = order::identities(&configured);
+        let identities = self.page_model(page).identities().to_vec();
         let shown: Vec<order::Identity> = {
             let arrangeable = self.arrangeable.borrow();
             let Some(tiles) = arrangeable.get(page) else {
@@ -2210,19 +2182,12 @@ impl Ui {
             .iter()
             .find(|(_, button)| button.is_focus())
             .map(|(index, _)| *index)?;
-        let names = self.listed_names(&Page::Main);
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        order::identities(&names).get(index).cloned()
+        self.page_model(&Page::Main).identity(index).cloned()
     }
 
     /// Selects the main-row tile with `identity`, if the row still has it.
     fn select_main(&self, identity: &order::Identity) {
-        let names = self.listed_names(&Page::Main);
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        let Some(index) = order::identities(&names)
-            .iter()
-            .position(|other| other == identity)
-        else {
+        let Some(index) = self.page_model(&Page::Main).index_of(identity) else {
             return;
         };
         let button = self
@@ -2352,9 +2317,7 @@ impl Ui {
         match entry.command {
             Command::Service(app) => self.shown.borrow_mut().remove(app.id),
             _ => {
-                let names = self.listed_names(&page);
-                let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                let identity = order::identities(&names)[index].clone();
+                let identity = self.page_model(&page).identities()[index].clone();
                 self.shown.borrow_mut().hide(&page.key(), identity);
             }
         }
@@ -2537,8 +2500,7 @@ impl Ui {
             Addable::Hidden { page, index } => {
                 let pages = configured_pages(&self.config.borrow());
                 let (key, label, entries) = &pages[page];
-                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-                let identity = order::identities(&names)[index].clone();
+                let identity = entry_page(key, entries).identities()[index].clone();
                 self.shown.borrow_mut().unhide(key, &identity);
                 let name = entries[index].name.clone();
                 let toast = format!("Put {name} back on {label}");

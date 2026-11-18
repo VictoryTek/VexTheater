@@ -5,6 +5,7 @@
 //! Browser profiles, running-app and mode records, GNOME snapshots and the system
 //! configuration are not part of it.
 
+use crate::model::PageModel;
 use crate::order::{self, Identity, Saved};
 use crate::tiles::{self, Shown};
 use crate::{catalog, files};
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 const FORMAT: &str = "vextheater-layout";
 const VERSION: u32 = 1;
 
-/// The page key and configured tile names of each page, as `window::page_names`
+/// The page key and configured tile names of each page, as `model::configured_names`
 /// gives them.
 pub type Pages = [(String, Vec<String>)];
 
@@ -120,8 +121,8 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
     let known: BTreeMap<&str, Vec<Identity>> = pages
         .iter()
         .map(|(key, names)| {
-            let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            (key.as_str(), order::identities(&names))
+            let page = PageModel::from_names(key, names.clone());
+            (key.as_str(), page.identities().to_vec())
         })
         .collect();
     // The tiles of a page as the launcher lists them: with the added services, which
@@ -130,10 +131,8 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
     let listed: BTreeMap<&str, Vec<Identity>> = pages
         .iter()
         .map(|(key, names)| {
-            let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            let listed = tiles::listed(key, &names, &shown);
-            let listed: Vec<&str> = listed.iter().map(|(_, name)| name.as_str()).collect();
-            (key.as_str(), order::identities(&listed))
+            let page = PageModel::listed(key, names, &shown);
+            (key.as_str(), page.identities().to_vec())
         })
         .collect();
     let matches = |page: &str, identity: &Identity| {
@@ -180,7 +179,9 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
     // How the configuration differs from the one the bundle was made for.
     for (page, identities) in &known {
         let was = bundle.inventory.get(*page).map_or(Vec::new(), |names| {
-            order::identities(&names.iter().map(String::as_str).collect::<Vec<_>>())
+            PageModel::from_names(page, names.clone())
+                .identities()
+                .to_vec()
         });
         let new: Vec<String> = identities
             .iter()
@@ -196,7 +197,9 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
     }
     for (page, names) in &bundle.inventory {
         let identities = known.get(page.as_str());
-        let was = order::identities(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let was = PageModel::from_names(page, names.clone())
+            .identities()
+            .to_vec();
         let gone: Vec<String> = was
             .iter()
             .filter(|identity| !identities.is_some_and(|known| known.contains(identity)))
@@ -385,12 +388,11 @@ mod tests {
         pages
             .iter()
             .map(|(key, names)| {
-                let configured: Vec<&str> = names.iter().map(String::as_str).collect();
-                let listed = tiles::listed(key, &configured, shown);
-                let names: Vec<&str> = listed.iter().map(|(_, name)| name.as_str()).collect();
-                let shown_names = tiles::visible(key, &names, shown, saved.get(key))
+                let page = PageModel::listed(key, names, shown);
+                let shown_names = page
+                    .shown(shown, saved)
                     .into_iter()
-                    .map(|index| names[index].to_owned())
+                    .map(|index| page.names()[index].clone())
                     .collect();
                 (key.clone(), shown_names)
             })
