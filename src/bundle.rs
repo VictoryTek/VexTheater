@@ -7,7 +7,7 @@
 
 use crate::model::PageModel;
 use crate::order::{self, Identity, Saved};
-use crate::tiles::{self, Shown};
+use crate::tiles::{self, AppTile, Shown};
 use crate::{catalog, files};
 use gio::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,10 @@ pub struct Bundle {
     version: u32,
     /// Ids of catalog services on the main row, in the order they were added.
     added: Vec<String>,
+    /// Installed applications on the main row, after the services, in the order they were
+    /// added. Left out of a bundle that has none, which is how older ones read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    apps: Vec<AppTile>,
     /// Configured tiles taken off a page, by page key.
     hidden: BTreeMap<String, Vec<Identity>>,
     /// Tile identities in their arranged order, by page key.
@@ -50,6 +54,7 @@ impl Bundle {
                 .filter(|id| catalog::find(id).is_some())
                 .cloned()
                 .collect(),
+            apps: shown.apps.clone(),
             hidden: shown.hidden.clone(),
             order: saved.clone(),
             inventory: pages.iter().cloned().collect(),
@@ -95,12 +100,22 @@ impl Bundle {
                 return Err(format!("the layout bundle adds \"{id}\" twice"));
             }
         }
+        let mut apps = BTreeSet::new();
+        for app in &bundle.apps {
+            if app.id.is_empty() || app.name.is_empty() {
+                return Err("the layout bundle has an installed app with no id or name".to_owned());
+            }
+            if !apps.insert(&app.id) {
+                return Err(format!("the layout bundle adds \"{}\" twice", app.id));
+            }
+        }
         Ok(bundle)
     }
 
     fn shown(&self) -> Shown {
         Shown {
             added: self.added.clone(),
+            apps: self.apps.clone(),
             hidden: self.hidden.clone(),
         }
     }
@@ -147,6 +162,13 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
         bundle.added.len(),
         bundle.order.len(),
     );
+    if !bundle.apps.is_empty() {
+        text.push_str(&format!(
+            "  {} installed app(s) to put on the main row.
+",
+            bundle.apps.len()
+        ));
+    }
     let mut problems = Vec::new();
 
     for (page, identities) in &bundle.hidden {
@@ -225,6 +247,27 @@ pub fn preview(bundle: &Bundle, pages: &Pages, current: (&Shown, &Saved)) -> Str
                     app.name
                 ));
             }
+        }
+    }
+
+    // An installed app is left out by the same rule the launcher uses: a name that a
+    // configured tile, a service, or an app before it has.
+    let configured: Vec<&str> = pages
+        .iter()
+        .find(|(key, _)| key == tiles::MAIN)
+        .map_or(Vec::new(), |(_, names)| {
+            names.iter().map(String::as_str).collect()
+        });
+    let on_row = tiles::listed(tiles::MAIN, &configured, &shown);
+    for (index, app) in bundle.apps.iter().enumerate() {
+        let kept = on_row
+            .iter()
+            .any(|(item, _)| *item == tiles::Item::Desktop(index));
+        if !kept {
+            problems.push(format!(
+                "{} is not shown: a tile of that name is on the main row",
+                app.name
+            ));
         }
     }
 
@@ -411,6 +454,7 @@ mod tests {
         ]);
         let shown = Shown {
             added: vec![a_service().to_owned()],
+            apps: vec![],
             hidden: BTreeMap::from([("main".to_owned(), vec![id("Browser", 1)])]),
         };
         let saved = Saved::from([
@@ -474,6 +518,58 @@ mod tests {
     }
 
     #[test]
+    fn installed_apps_travel_in_the_bundle_and_older_bundles_still_read() {
+        let (pages, mut shown, mut saved) = a_layout();
+        // A bundle made without apps has no mention of them, as before.
+        let plain = Bundle::capture(&pages, &shown, &saved).to_text();
+        assert!(!plain.contains("apps"));
+        assert!(Bundle::parse(&plain).unwrap().apps.is_empty());
+
+        shown.add_app("calc.desktop", "Calculator");
+        saved
+            .get_mut("main")
+            .unwrap()
+            .insert(0, id("Calculator", 0));
+        let before = effective(&pages, &shown, &saved);
+        assert_eq!(before[0].1[0], "Calculator");
+        let text = Bundle::capture(&pages, &shown, &saved).to_text();
+        let bundle = Bundle::parse(&text).unwrap();
+        let there = targets("with-apps");
+        apply(&bundle, &pages, &there).unwrap();
+        let (shown_back, saved_back) = there.load();
+        assert_eq!(shown_back.apps, shown.apps);
+        assert_eq!(effective(&pages, &shown_back, &saved_back), before);
+        assert!(preview(&bundle, &pages, (&Shown::default(), &Saved::new()))
+            .contains("1 installed app(s)"));
+
+        let bad = |text: &str| Bundle::parse(text).unwrap_err();
+        assert!(bad(&text.replace("\"id\": \"calc.desktop\"", "\"id\": \"\"")).contains("no id"));
+        let twice = text.replace(
+            "\"apps\": [",
+            "\"apps\": [ { \"id\": \"calc.desktop\", \"name\": \"Other\" },",
+        );
+        assert!(bad(&twice).contains("twice"));
+    }
+
+    #[test]
+    fn the_preview_says_which_installed_apps_a_name_clash_leaves_out() {
+        let (pages, _, _) = a_layout();
+        let service = catalog::find(a_service()).unwrap().name;
+        let mut shown = Shown::default();
+        shown.added.push(a_service().to_owned());
+        shown.add_app("a.desktop", service); // the service has this name
+        shown.add_app("b.desktop", "Twin");
+        shown.add_app("c.desktop", "Twin"); // a second app with a name already used
+        shown.add_app("d.desktop", "Fine");
+        let bundle = Bundle::capture(&pages, &shown, &Saved::new());
+        let text = preview(&bundle, &pages, (&Shown::default(), &Saved::new()));
+        assert_eq!(text.matches("is not shown").count(), 2, "{text}");
+        assert!(text.contains(&format!("{service} is not shown")));
+        assert!(text.contains("Twin is not shown"));
+        assert!(!text.contains("Fine is not shown"));
+    }
+
+    #[test]
     fn a_rejected_bundle_changes_nothing() {
         // Parsing is all that happens before apply; a bad file never reaches it.
         let there = targets("rejected");
@@ -532,6 +628,7 @@ mod tests {
         let shown = Shown {
             added: vec![a_service().to_owned()],
             hidden: BTreeMap::new(),
+            apps: vec![],
         };
         let saved = Saved::from([("main".to_owned(), vec![id(service, 0), id("Files", 0)])]);
         let bundle = Bundle::capture(&pages, &shown, &saved);

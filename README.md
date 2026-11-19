@@ -123,8 +123,16 @@ menu, the Add page and the confirmations have none.
   the services of the catalog (below) that are not on the launcher. Choosing one puts it
   on the launcher and selects it. A service goes last on the main row, and can be moved
   like any tile; a tile put back returns to the place the saved order had it in. With
-  nothing to add, the page holds only "Setup & health" (see Troubleshooting), which is
-  always its last tile.
+  nothing to add, the page holds "Installed apps" and "Setup & health" (see
+  Troubleshooting), which is always its last tile.
+- **Installed apps**, on the + page, lists the applications this machine's menu shows,
+  with the same search box and letter groups as Browse all. Choosing one puts it last on
+  the main row (after the services) and selects it; it can be moved and removed like any
+  tile. An application has one tile: choosing one that is already there selects it, and
+  one that matches a configured tile you removed puts that tile back. A name a main-row
+  tile already has is not added twice. If the application is uninstalled later, its tile
+  stays, dimmed, and says "Not installed". This only picks what is installed; it does not
+  install anything.
 - The **magnifier** button, left of **+** (or `/`, or Ctrl+F, on the main row), opens
   "Browse all": every app tile you can reach, from the main row and from the submenus it
   opens, each with where it is ("in Games", and "2 of 3" when several are called the same).
@@ -149,8 +157,13 @@ What was added and removed is saved in `$XDG_STATE_HOME/vextheater/tiles.json`
 
 ```json
 { "added": ["netflix", "disney-plus"],
+  "apps": [{ "id": "org.gnome.Calculator.desktop", "name": "Calculator" }],
   "hidden": { "main": [["Plex", 0]], "submenu:Games": [["Doom", 0]] } }
 ```
+
+`apps` is left out until you add an installed application. It holds the id of the desktop
+entry and the name it had, which keeps the tile's place in the saved order if the
+application goes. Older files without it still load.
 
 `added` holds the ids of catalog services (on the main row); `hidden` the configured
 tiles that were removed, by page, in the identity the order uses (name, and place among
@@ -177,7 +190,7 @@ moved a tile.
 services added, the configured tiles removed, and the order of each page) as one versioned
 JSON bundle, to FILE or to standard output. `vextheater --import-layout FILE` reads a
 bundle and only says what restoring it would do: how many services, removals and orders it
-holds, which entries match no tile of the current configuration, which tiles were
+holds (and the installed apps it adds, which need not be installed here), which entries match no tile of the current configuration, which tiles were
 configured since the export or are gone now, and whether it differs from your current
 layout. Add `--apply` to restore it. Neither needs a display. A file that is not valid
 JSON, not a layout bundle, of another version, or that names an unknown service is

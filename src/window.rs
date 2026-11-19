@@ -45,6 +45,12 @@ enum Command {
     ResetOrder,
     /// Opens a service of the catalog: as a web app, or as its Flatpak app.
     Service(&'static catalog::App),
+    /// Starts an installed application the user put on the launcher, by the id of its
+    /// desktop entry.
+    Installed(String),
+    /// Opens the list of installed applications to put one on the launcher; a choice on
+    /// the Add page.
+    Apps,
     /// Puts something on the launcher; a choice on the Add page.
     Add(Addable),
     /// Picks the tile of the options page up, to move it.
@@ -67,6 +73,7 @@ impl Command {
     fn is_installed(&self, browser: Option<&str>) -> bool {
         match self {
             Command::Config(action) => launch::is_installed(action),
+            Command::Installed(id) => launch::is_installed(&Action::Desktop(id.clone())),
             Command::Service(app) => match app.flatpak {
                 Some(id) => launch::is_installed(&Action::Flatpak(id.to_owned())),
                 None => webapp::find_browser(browser).is_some(),
@@ -74,6 +81,7 @@ impl Command {
             Command::Cancel
             | Command::ResetOrder
             | Command::Add(_)
+            | Command::Apps
             | Command::Move
             | Command::Remove
             | Command::Health
@@ -88,6 +96,7 @@ impl Command {
         match self {
             Command::Config(Action::Command(_)) => Some("command"),
             Command::Config(Action::Desktop(_)) => Some("desktop"),
+            Command::Installed(_) => Some("desktop"),
             Command::Config(Action::Flatpak(_)) => Some("flatpak"),
             Command::Service(app) if app.flatpak.is_some() => Some("flatpak"),
             Command::Service(_) => Some("web"),
@@ -166,6 +175,8 @@ impl Confirmable {
             )
             | Command::Cancel
             | Command::Service(_)
+            | Command::Installed(_)
+            | Command::Apps
             | Command::Add(_)
             | Command::Move
             | Command::Health
@@ -381,7 +392,16 @@ pub fn order_listing(config: &Config, saved: &crate::order::Saved, shown: &tiles
 
 /// The page `key` whose list of tiles is `entries`.
 fn entry_page(key: &str, entries: &[Entry]) -> crate::model::PageModel {
-    crate::model::PageModel::from_names(key, entries.iter().map(|e| e.name.clone()).collect())
+    // The configured tiles come first, then the services and applications that were added.
+    let configured = entries
+        .iter()
+        .take_while(|entry| matches!(entry.command, Command::Config(_)))
+        .count();
+    crate::model::PageModel::with_configured(
+        key,
+        entries.iter().map(|e| e.name.clone()).collect(),
+        configured,
+    )
 }
 
 /// The tiles that start an app, as JSON for scripts: each shown tile of the main row and
@@ -723,6 +743,11 @@ struct Ui {
     /// Enter moved the focus to the results while a filter was still waiting to be
     /// applied; see `show_browse`.
     browse_to_results: Cell<bool>,
+    /// The page is the list of installed applications to put on the launcher, not Browse
+    /// all: what it lists is `installed_apps`, and choosing one adds it.
+    browse_adding: Cell<bool>,
+    browse_title: Cell<&'static str>,
+    installed_apps: RefCell<Vec<InstalledApp>>,
     browse_search: gtk::SearchEntry,
     browse_button: gtk::Button,
     /// The title label of each page that has one, for the pages whose title changes.
@@ -906,6 +931,9 @@ impl Ui {
             browse_query: RefCell::default(),
             browse_letter: Cell::new(None),
             browse_to_results: Cell::new(false),
+            browse_adding: Cell::new(false),
+            browse_title: Cell::new("Browse all"),
+            installed_apps: RefCell::default(),
             browse_search,
             browse_button: browse_button.clone(),
             titles: RefCell::default(),
@@ -2088,6 +2116,19 @@ impl Ui {
             }
             // Checked again here, not read from `missing`: the app may have been installed
             // since. Nothing is closed for an app that cannot start.
+            Command::Apps => {
+                self.open_installed(button);
+                Ok(())
+            }
+            Command::Installed(_) if !self.installed(&entry.command) => {
+                self.notify(&format!("{} isn't installed", entry.name));
+                Ok(())
+            }
+            Command::Installed(id) => {
+                self.remember_origin(page, button);
+                self.launch(&entry.name, &Action::Desktop(id.clone()));
+                Ok(())
+            }
             Command::Config(Action::Command(_) | Action::Desktop(_) | Action::Flatpak(_))
                 if !self.installed(&entry.command) =>
             {
@@ -2252,7 +2293,40 @@ impl Ui {
 
     /// Opens Browse all with nothing typed.
     fn open_browse(self: &Rc<Self>, opener: &gtk::Button) {
-        *self.browse_found.borrow_mut() = self.reachable_apps();
+        let found = self.reachable_apps();
+        self.open_filter(found, "Browse all", false, opener);
+    }
+
+    /// Opens the list of installed applications, to put one on the launcher.
+    fn open_installed(self: &Rc<Self>, opener: &gtk::Button) {
+        let apps = discover_installed();
+        let found = apps
+            .iter()
+            .enumerate()
+            .map(|(index, app)| {
+                browse::Found::installed(
+                    index,
+                    &app.name,
+                    &self.installed_status(app),
+                    app.description.clone(),
+                )
+            })
+            .collect();
+        *self.installed_apps.borrow_mut() = apps;
+        self.open_filter(found, "Installed apps", true, opener);
+    }
+
+    /// The filtered page of `found`, with nothing typed.
+    fn open_filter(
+        self: &Rc<Self>,
+        found: Vec<browse::Found>,
+        title: &'static str,
+        adding: bool,
+        opener: &gtk::Button,
+    ) {
+        *self.browse_found.borrow_mut() = found;
+        self.browse_adding.set(adding);
+        self.browse_title.set(title);
         self.browse_query.take();
         self.browse_letter.set(None);
         self.browse_search.set_text("");
@@ -2273,7 +2347,7 @@ impl Ui {
         let (hits, entries): (Vec<usize>, Vec<Entry>) = browse::matches(&found, &query, letter)
             .into_iter()
             .filter_map(|hit| {
-                let (_, entry) = self.entry_of(&found[hit])?;
+                let entry = self.browse_entry(&found[hit])?;
                 let description = Some(found[hit].detail());
                 Some((
                     hit,
@@ -2303,7 +2377,7 @@ impl Ui {
         self.forget_page(&Page::Browse);
         *self.browse_hits.borrow_mut() = hits;
         *self.browse_entries.borrow_mut() = entries.clone();
-        self.add_page(Page::Browse, Some("Browse all"), &entries, false);
+        self.add_page(Page::Browse, Some(self.browse_title.get()), &entries, false);
 
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -2406,9 +2480,14 @@ impl Ui {
             let all = self.browse_found.borrow();
             hits.get(hit).and_then(|index| all.get(*index)).cloned()
         };
-        let Some((found, (page, entry))) =
-            found.and_then(|found| self.entry_of(&found).map(|tile| (found, tile)))
-        else {
+        let Some(found) = found else {
+            return;
+        };
+        if self.browse_adding.get() {
+            self.add_installed(&found);
+            return;
+        }
+        let Some((page, entry)) = self.entry_of(&found) else {
             return;
         };
         self.activate(&page, &entry, button);
@@ -2665,6 +2744,9 @@ impl Ui {
         });
         match entry.command {
             Command::Service(app) => self.shown.borrow_mut().remove(app.id),
+            Command::Installed(id) if self.is_added_app(&id) => {
+                self.shown.borrow_mut().remove_app(&id)
+            }
             _ => {
                 let identity = self.page_model(&page).identities()[index].clone();
                 self.shown.borrow_mut().hide(&page.key(), identity);
@@ -2721,6 +2803,12 @@ impl Ui {
         self.forget_page(&Page::Add);
 
         let mut entries = self.addable_entries();
+        entries.push(entry(
+            "Installed apps",
+            "view-app-grid-symbolic",
+            "Pick any application installed on this machine",
+            Command::Apps,
+        ));
         entries.push(entry(
             "Setup & health",
             "preferences-system-symbolic",
@@ -2837,11 +2925,11 @@ impl Ui {
     /// Puts a choice of the Add page on the launcher, and selects it if it is on the
     /// main row.
     fn add_tile(self: &Rc<Self>, offer: Addable) {
-        let (name, page, toast) = match offer {
+        let (command, page, toast) = match offer {
             Addable::Catalog(app) => {
                 self.shown.borrow_mut().add(app.id);
                 (
-                    app.name.to_owned(),
+                    Command::Service(app),
                     Page::Main,
                     format!("Added {}", app.name),
                 )
@@ -2851,25 +2939,144 @@ impl Ui {
                 let (key, label, entries) = &pages[page];
                 let identity = entry_page(key, entries).identities()[index].clone();
                 self.shown.borrow_mut().unhide(key, &identity);
-                let name = entries[index].name.clone();
-                let toast = format!("Put {name} back on {label}");
-                (name, Page::from_key(key).unwrap_or(Page::Main), toast)
+                let toast = format!("Put {} back on {label}", entries[index].name);
+                let command = entries[index].command.clone();
+                (command, Page::from_key(key).unwrap_or(Page::Main), toast)
             }
         };
         self.save_shown();
         self.rebuild(None);
         self.notify(&toast);
+        // Selected by what it starts, not its name: tiles of one name can start different
+        // apps.
         if page == Page::Main {
-            let button = self.arrangeable.borrow().get(&page).and_then(|tiles| {
-                tiles
-                    .buttons
-                    .iter()
-                    .find(|(index, _)| self.tile(&page, *index).name == name)
-                    .map(|(_, button)| button.clone())
+            self.focus_tile_with(&Page::Main, &command);
+        }
+    }
+
+    /// Selects the shown tile of `page` that starts `command`, by what it starts, not by
+    /// its name (an added application keeps the name it had when it was added).
+    fn focus_tile_with(&self, page: &Page, command: &Command) {
+        let button = self.arrangeable.borrow().get(page).and_then(|tiles| {
+            tiles
+                .buttons
+                .iter()
+                .find(|(index, _)| self.tile(page, *index).command == *command)
+                .map(|(_, button)| button.clone())
+        });
+        if let Some(button) = button {
+            button.grab_focus();
+        }
+    }
+
+    /// The tile `found` stands for on the list the filtered page shows: an installed
+    /// application when adding, else a tile of the launcher.
+    fn browse_entry(&self, found: &browse::Found) -> Option<Entry> {
+        if self.browse_adding.get() {
+            let apps = self.installed_apps.borrow();
+            let app = apps.get(found.index)?;
+            return Some(Entry {
+                name: app.name.clone(),
+                icon: None,
+                description: None,
+                command: Command::Installed(app.id.clone()),
             });
-            if let Some(button) = button {
-                button.grab_focus();
+        }
+        self.entry_of(found).map(|(_, entry)| entry)
+    }
+
+    /// Whether `id` is an installed application the user put on the main row.
+    fn is_added_app(&self, id: &str) -> bool {
+        self.shown.borrow().apps.iter().any(|app| app.id == id)
+    }
+
+    /// The configured tile that starts the desktop entry `id`, as its index in
+    /// `configured_pages` and in that page, and whether it is removed.
+    fn configured_desktop(&self, id: &str) -> Option<(usize, usize, bool)> {
+        let pages = configured_pages(&self.config.borrow());
+        let shown = self.shown.borrow();
+        for (page, (key, _, entries)) in pages.iter().enumerate() {
+            let model = entry_page(key, entries);
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.command == Command::Config(Action::Desktop(id.to_owned())) {
+                    let hidden = shown.hidden_on(key).contains(&model.identities()[index]);
+                    return Some((page, index, hidden));
+                }
             }
+        }
+        None
+    }
+
+    /// What the list of installed applications says under `app`: that it is on the
+    /// launcher already, or removed from it, or that its name is taken.
+    fn installed_status(&self, app: &InstalledApp) -> String {
+        if self.is_added_app(&app.id) {
+            return "On the main row".to_owned();
+        }
+        if let Some((_, _, hidden)) = self.configured_desktop(&app.id) {
+            return if hidden {
+                "Removed: choose it to put it back".to_owned()
+            } else {
+                "Already on the launcher".to_owned()
+            };
+        }
+        let names = self.page_model(&Page::Main);
+        if names.names().contains(&app.name) {
+            return "A tile with this name is on the main row".to_owned();
+        }
+        String::new()
+    }
+
+    /// Puts the installed application `found` stands for on the main row. One that is
+    /// there already is selected instead, and a configured tile for it that was removed
+    /// is put back: an application has one tile.
+    fn add_installed(self: &Rc<Self>, found: &browse::Found) {
+        let Some(app) = self.installed_apps.borrow().get(found.index).cloned() else {
+            return;
+        };
+        if self.is_added_app(&app.id) {
+            self.main_row();
+            self.focus_tile_with(&Page::Main, &Command::Installed(app.id.clone()));
+            self.notify(&format!("{} is on the main row", app.name));
+            return;
+        }
+        match self.configured_desktop(&app.id) {
+            Some((page, index, true)) => {
+                self.add_tile(Addable::Hidden { page, index });
+                return;
+            }
+            Some((page, _, false)) => {
+                // Go to the tile: on the main row, or in the submenu it is in.
+                let pages = configured_pages(&self.config.borrow());
+                let page = Page::from_key(&pages[page].0).unwrap_or(Page::Main);
+                self.main_row();
+                if self.reopen(&page) {
+                    let command = Command::Config(Action::Desktop(app.id.clone()));
+                    self.focus_tile_with(&page, &command);
+                    self.notify(&format!("{} is already on the launcher", app.name));
+                } else {
+                    // Only a submenu opened straight from the main row is followed.
+                    self.notify(&format!(
+                        "{} is already on the launcher, in a submenu",
+                        app.name
+                    ));
+                }
+                return;
+            }
+            None => {}
+        }
+        if self.page_model(&Page::Main).names().contains(&app.name) {
+            self.notify(&format!(
+                "A tile called {} is already on the main row",
+                app.name
+            ));
+            return;
+        }
+        if self.shown.borrow_mut().add_app(&app.id, &app.name) {
+            self.save_shown();
+            self.rebuild(None);
+            self.notify(&format!("Added {}", app.name));
+            self.focus_tile_with(&Page::Main, &Command::Installed(app.id.clone()));
         }
     }
 
@@ -3194,6 +3401,7 @@ fn main_entries(config: &Config, shown: &tiles::Shown) -> Vec<Entry> {
         .map(|(item, _)| match item {
             tiles::Item::Configured(index) => Entry::from(&config.tiles[index]),
             tiles::Item::Catalog(app) => catalog_entry(app),
+            tiles::Item::Desktop(index) => installed_entry(&shown.apps[index]),
         })
         .collect()
 }
@@ -3204,6 +3412,50 @@ fn submenu_entries(config: &Config) -> BTreeMap<String, Vec<Entry>> {
         .iter()
         .map(|(name, tiles)| (name.clone(), tiles.iter().map(Entry::from).collect()))
         .collect()
+}
+
+/// The tile of an installed application the user put on the main row.
+fn installed_entry(app: &tiles::AppTile) -> Entry {
+    Entry {
+        name: app.name.clone(),
+        icon: None,
+        description: None,
+        command: Command::Installed(app.id.clone()),
+    }
+}
+
+/// An application installed on this machine that the user can put on the launcher.
+#[derive(Clone, Debug, PartialEq)]
+struct InstalledApp {
+    /// The id of its desktop entry, which is what starts it.
+    id: String,
+    name: String,
+    description: Option<String>,
+}
+
+/// The applications the desktop's own menu shows, by name. The launcher itself is not
+/// one, and an entry that is hidden from menus (`NoDisplay`, or for another desktop) is
+/// not offered.
+fn discover_installed() -> Vec<InstalledApp> {
+    let own = format!("{}.desktop", crate::APP_ID);
+    let mut apps: Vec<InstalledApp> = gio::AppInfo::all()
+        .into_iter()
+        .filter(|app| app.should_show())
+        .filter_map(|app| {
+            let id = app.id()?.to_string();
+            (id != own).then(|| InstalledApp {
+                id,
+                name: app.name().to_string(),
+                description: app
+                    .description()
+                    .map(|text| text.to_string())
+                    .filter(|text| !text.is_empty()),
+            })
+        })
+        .collect();
+    apps.sort_by_key(|app| (app.name.to_lowercase(), app.id.clone()));
+    apps.dedup_by(|a, b| a.id == b.id);
+    apps
 }
 
 fn catalog_entry(app: &'static catalog::App) -> Entry {
@@ -3358,10 +3610,12 @@ fn find_icon(tile: &Entry, theme: Option<&gtk::IconTheme>) -> Result<gio::Icon, 
             gio::FileIcon::new(&gio::File::for_path(icon)).upcast()
         }
         (Some(icon), _) => gio::ThemedIcon::new(icon).upcast(),
-        (None, Command::Config(Action::Desktop(id))) => gio_unix::DesktopAppInfo::new(id)
-            .ok_or_else(|| format!("no desktop file {id}"))?
-            .icon()
-            .ok_or_else(|| format!("{id} names no icon"))?,
+        (None, Command::Config(Action::Desktop(id)) | Command::Installed(id)) => {
+            gio_unix::DesktopAppInfo::new(id)
+                .ok_or_else(|| format!("no desktop file {id}"))?
+                .icon()
+                .ok_or_else(|| format!("{id} names no icon"))?
+        }
         (None, Command::Config(Action::Flatpak(id))) => gio::ThemedIcon::new(id).upcast(),
         (None, _) => return Err("no icon".into()),
     };
@@ -3703,6 +3957,7 @@ mod tests {
         .unwrap();
         let shown = crate::tiles::Shown {
             added: vec![],
+            apps: vec![],
             hidden: std::collections::BTreeMap::from([(
                 "main".to_owned(),
                 vec![("Browser".to_owned(), 0)],
@@ -3759,6 +4014,7 @@ mod tests {
                 .map(|app| app.id.to_owned())
                 .collect(),
             hidden: Default::default(),
+            apps: vec![],
         };
         let listing: Vec<serde_json::Value> =
             serde_json::from_str(&tile_listing(&config, &crate::order::Saved::new(), &shown))

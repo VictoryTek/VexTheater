@@ -13,12 +13,26 @@ use std::path::PathBuf;
 /// The page key of the main row, which is where added tiles go.
 pub const MAIN: &str = "main";
 
+/// An installed application the user put on the main row: the id of its desktop entry,
+/// and the name it had then. The name is kept so the tile keeps its identity in the saved
+/// order whatever happens to the app; its icon and what starts are read from the desktop
+/// entry each time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppTile {
+    pub id: String,
+    pub name: String,
+}
+
 /// What the user changed, as saved in `tiles.json`.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Shown {
     /// Ids of catalog services on the main row, in the order they were added.
     #[serde(default)]
     pub added: Vec<String>,
+    /// Installed applications on the main row, after the catalog services, in the order
+    /// they were added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<AppTile>,
     /// Configured tiles taken off a page, by page key.
     #[serde(default)]
     pub hidden: BTreeMap<String, Vec<Identity>>,
@@ -52,6 +66,24 @@ impl Shown {
         if catalog::find(id).is_some() && !self.added.iter().any(|added| added == id) {
             self.added.push(id.to_owned());
         }
+    }
+
+    /// Puts an installed application on the main row. Nothing for an id that is already
+    /// there, or an empty id or name. True if it was added.
+    pub fn add_app(&mut self, id: &str, name: &str) -> bool {
+        if id.is_empty() || name.is_empty() || self.apps.iter().any(|app| app.id == id) {
+            return false;
+        }
+        self.apps.push(AppTile {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        });
+        true
+    }
+
+    /// Takes an installed application off the main row.
+    pub fn remove_app(&mut self, id: &str) {
+        self.apps.retain(|app| app.id != id);
     }
 
     /// Takes a catalog service off the main row.
@@ -90,6 +122,8 @@ pub enum Item {
     /// The configured tile at this index of the page.
     Configured(usize),
     Catalog(&'static App),
+    /// The installed application at this index of `Shown::apps`.
+    Desktop(usize),
 }
 
 /// The tiles of a page before they are arranged, with their names: the configured ones,
@@ -112,6 +146,11 @@ pub fn listed(page: &str, configured: &[&str], state: &Shown) -> Vec<(Item, Stri
                 list.push((Item::Catalog(app), app.name.to_owned()));
             }
         }
+        for (index, app) in state.apps.iter().enumerate() {
+            if !list.iter().any(|(_, name)| *name == app.name) {
+                list.push((Item::Desktop(index), app.name.clone()));
+            }
+        }
     }
     list
 }
@@ -119,17 +158,20 @@ pub fn listed(page: &str, configured: &[&str], state: &Shown) -> Vec<(Item, Stri
 /// The indexes into a page's list (`names`, as [`listed`] gives them) of the tiles to
 /// show, in the order to show them: arranged by the saved order, without the configured
 /// tiles that were removed. Identities are those of the whole list, so removing a tile
-/// never changes another's.
+/// never changes another's. The first `configured` tiles are the configured ones; only
+/// they can be removed this way, so a record for a tile the configuration no longer has
+/// never hides a service or an application of the same name.
 pub fn visible(
     page: &str,
     names: &[&str],
+    configured: usize,
     state: &Shown,
     saved: Option<&Vec<Identity>>,
 ) -> Vec<usize> {
     let identities = order::identities(names);
     order::arrange(names, saved)
         .into_iter()
-        .filter(|&index| !state.is_hidden(page, &identities[index]))
+        .filter(|&index| index >= configured || !state.is_hidden(page, &identities[index]))
         .collect()
 }
 
@@ -174,8 +216,8 @@ pub enum Addable {
 /// What can be put on the launcher: removed configured tiles first, then the catalog
 /// services that are not shown. `pages` are the configured tile names of each page, the
 /// main row first, with the page's key. A hidden identity that matches no tile is
-/// ignored, as is a catalog service whose name a main-row tile has (hidden or not): it
-/// would be a second tile of the same name.
+/// ignored, as is a catalog service whose name a main-row tile has (hidden or not), or an
+/// installed application that was added: it would be a second tile of the same name.
 pub fn addable(pages: &[(&str, Vec<&str>)], state: &Shown) -> Vec<Addable> {
     let mut offers = Vec::new();
     for (page, (key, names)) in pages.iter().enumerate() {
@@ -195,6 +237,12 @@ pub fn addable(pages: &[(&str, Vec<&str>)], state: &Shown) -> Vec<Addable> {
             .iter()
             .filter(|app| !state.added.iter().any(|added| added == app.id))
             .filter(|app| !main_names.contains(&app.name))
+            .filter(|app| {
+                !state
+                    .apps
+                    .iter()
+                    .any(|installed| installed.name == app.name)
+            })
             .map(Addable::Catalog),
     );
     offers
@@ -215,6 +263,7 @@ mod tests {
     fn state(added: &[&str], hidden: &[(&str, &[&str])]) -> Shown {
         Shown {
             added: added.iter().map(|s| (*s).to_owned()).collect(),
+            apps: vec![],
             hidden: hidden
                 .iter()
                 .map(|(page, names)| ((*page).to_owned(), ids(names)))
@@ -231,7 +280,7 @@ mod tests {
     ) -> Vec<(Item, String)> {
         let list = listed(page, configured, state);
         let names: Vec<&str> = list.iter().map(|(_, name)| name.as_str()).collect();
-        visible(page, &names, state, saved)
+        visible(page, &names, configured.len(), state, saved)
             .into_iter()
             .map(|index| list[index].clone())
             .collect()
@@ -254,6 +303,86 @@ mod tests {
                 Item::Configured(2)
             ]
         );
+    }
+
+    #[test]
+    fn an_installed_app_goes_after_the_services_on_the_main_row_only() {
+        let service = catalog::APPS[0].id;
+        let mut state = state(&[service], &[]);
+        assert!(state.add_app("calc.desktop", "Calculator"));
+        let main = show(MAIN, &["Files"], &state, None);
+        assert_eq!(names(&main), ["Files", catalog::APPS[0].name, "Calculator"]);
+        assert_eq!(main[2].0, Item::Desktop(0));
+        let submenu = show("submenu:Games", &["Files"], &state, None);
+        assert_eq!(names(&submenu), ["Files"]);
+        // Arranged and hidden like any other tile of the main row.
+        let saved = vec![id("Calculator"), id("Files")];
+        let arranged = show(MAIN, &["Files"], &state, Some(&saved));
+        assert_eq!(names(&arranged)[..2], ["Calculator", "Files"]);
+    }
+
+    #[test]
+    fn a_removal_record_for_a_tile_the_configuration_lost_hides_no_added_tile() {
+        // "Calculator" was a configured tile, removed, and then dropped from the
+        // configuration; an app or service of that name must still show.
+        let mut state = state(&[], &[(MAIN, &["Calculator"])]);
+        state.add_app("calc.desktop", "Calculator");
+        let main = show(MAIN, &["Files"], &state, None);
+        assert_eq!(names(&main), ["Files", "Calculator"]);
+        // While the configured tile is there, the record still hides it.
+        let both = show(MAIN, &["Calculator", "Files"], &state, None);
+        assert_eq!(names(&both), ["Files"]);
+    }
+
+    #[test]
+    fn a_service_is_not_offered_under_the_name_of_an_added_app() {
+        let service: &'static App = &catalog::APPS[0];
+        let pages = [(MAIN, vec!["Files"])];
+        let offered = |state: &Shown| addable(&pages, state).contains(&Addable::Catalog(service));
+        assert!(offered(&Shown::default()));
+        let mut state = Shown::default();
+        state.add_app("x.desktop", service.name);
+        assert!(!offered(&state));
+    }
+
+    #[test]
+    fn an_installed_app_is_added_once_by_its_id_and_removed_by_it() {
+        let mut state = Shown::default();
+        assert!(state.add_app("calc.desktop", "Calculator"));
+        assert!(!state.add_app("calc.desktop", "Calculator again"));
+        assert!(!state.add_app("", "No id"));
+        assert!(!state.add_app("x.desktop", ""));
+        assert_eq!(state.apps.len(), 1);
+        state.remove_app("other.desktop");
+        assert_eq!(state.apps.len(), 1);
+        state.remove_app("calc.desktop");
+        assert!(state.apps.is_empty());
+    }
+
+    #[test]
+    fn an_installed_app_whose_name_a_configured_tile_has_is_left_out() {
+        let mut state = Shown::default();
+        state.add_app("calc.desktop", "Files");
+        state.add_app("t.desktop", "Terminal");
+        let main = show(MAIN, &["Files"], &state, None);
+        assert_eq!(names(&main), ["Files", "Terminal"]);
+        assert_eq!(main[1].0, Item::Desktop(1));
+    }
+
+    #[test]
+    fn a_saved_file_without_apps_loads_and_one_with_apps_round_trips() {
+        let old = read("old.json", r#"{ "added": ["netflix"], "hidden": {} }"#);
+        assert!(old.apps.is_empty());
+        assert_eq!(old.added, ["netflix"]);
+        let mut state = Shown::default();
+        state.add_app("calc.desktop", "Calculator");
+        let text = serde_json::to_string(&state).unwrap();
+        assert!(text.contains("calc.desktop"));
+        assert_eq!(read("new.json", &text), state);
+        // Nothing about apps is written for a state that has none, so the file is as
+        // before for a user who never adds one.
+        let plain = serde_json::to_string(&Shown::default()).unwrap();
+        assert!(!plain.contains("apps"));
     }
 
     #[test]

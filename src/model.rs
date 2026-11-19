@@ -17,17 +17,27 @@ pub struct PageModel {
     key: String,
     names: Vec<String>,
     identities: Vec<Identity>,
+    /// How many of the first tiles are configured ones, the only tiles that can be
+    /// removed (the rest are services and applications that were added).
+    configured: usize,
 }
 
 impl PageModel {
     /// A page whose list is exactly `names`.
     pub fn from_names(key: &str, names: Vec<String>) -> PageModel {
+        let configured = names.len();
+        PageModel::with_configured(key, names, configured)
+    }
+
+    /// A page whose list is `names`, the first `configured` of which are configured tiles.
+    pub fn with_configured(key: &str, names: Vec<String>, configured: usize) -> PageModel {
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let identities = order::identities(&refs);
         PageModel {
             key: key.to_owned(),
             names,
             identities,
+            configured,
         }
     }
 
@@ -39,7 +49,7 @@ impl PageModel {
             .into_iter()
             .map(|(_, name)| name)
             .collect();
-        PageModel::from_names(key, names)
+        PageModel::with_configured(key, names, configured.len())
     }
 
     pub fn key(&self) -> &str {
@@ -67,7 +77,13 @@ impl PageModel {
     /// without the tiles removed in `state`.
     pub fn shown(&self, state: &Shown, saved: &Saved) -> Vec<usize> {
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
-        tiles::visible(&self.key, &names, state, saved.get(&self.key))
+        tiles::visible(
+            &self.key,
+            &names,
+            self.configured,
+            state,
+            saved.get(&self.key),
+        )
     }
 }
 
@@ -125,6 +141,7 @@ mod tests {
         let page = PageModel::from_names("main", names(&["A", "B", "A", "C"]));
         let state = Shown {
             added: vec![],
+            apps: vec![],
             hidden: [("main".to_owned(), vec![id("A", 0)])].into(),
         };
         let saved = Saved::from([("main".to_owned(), vec![id("C", 0), id("A", 1), id("A", 0)])]);
@@ -143,6 +160,7 @@ mod tests {
         let state = Shown {
             added: vec![service.id.to_owned()],
             hidden: Default::default(),
+            apps: vec![],
         };
         let configured = names(&["Files"]);
         let main = PageModel::listed("main", &configured, &state);

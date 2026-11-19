@@ -43,11 +43,26 @@ pub struct Found {
 }
 
 impl Found {
+    /// An installed application to pick, number `index` of the list the picker holds.
+    /// `status` says what is already so for it (on the launcher, say), or is empty.
+    pub fn installed(index: usize, name: &str, status: &str, description: Option<String>) -> Found {
+        Found {
+            page: "apps".to_owned(),
+            index,
+            via: 0,
+            identity: (name.to_owned(), 0),
+            name: name.to_owned(),
+            context: status.to_owned(),
+            description,
+        }
+    }
+
     /// The text under the tile's name: where it is, then its own description.
     pub fn detail(&self) -> String {
-        match &self.description {
-            Some(description) => format!("{} · {description}", self.context),
-            None => self.context.clone(),
+        match (&self.description, self.context.is_empty()) {
+            (Some(description), false) => format!("{} · {description}", self.context),
+            (Some(description), true) => description.clone(),
+            (None, _) => self.context.clone(),
         }
     }
 }
@@ -211,6 +226,7 @@ mod tests {
     fn hide(page: &str, name: &str, nth: usize) -> Shown {
         Shown {
             added: vec![],
+            apps: vec![],
             hidden: [(page.to_owned(), vec![(name.to_owned(), nth)])].into(),
         }
     }
