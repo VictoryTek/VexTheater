@@ -142,3 +142,44 @@ button.power-button:focus {
   transform: scale(1.2);
   box-shadow: 0 0 0 4px #ffffff, 0 0 24px 8px rgba(255, 255, 255, 0.35);
 }
+
+/* ── Browse all ───────────────────────────────────────────────────────────────
+   The search box and the letter groups above the results. */
+
+searchentry.browse-search {
+  min-height: 56px;
+  padding: 0 20px;
+  font-size: 24px;
+  color: #ffffff;
+  border-radius: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background-color: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+}
+
+searchentry.browse-search:focus-within {
+  box-shadow: 0 0 0 4px var(--accent-bg-color);
+}
+
+button.letter-chip {
+  min-width: 48px;
+  min-height: 48px;
+  padding: 0 14px;
+  border-radius: 24px;
+  font-size: 20px;
+  font-weight: 600;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background-color: rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+  outline: none;
+}
+
+button.letter-chip.current {
+  background-color: rgba(255, 255, 255, 0.28);
+}
+
+button.letter-chip:focus {
+  background-color: var(--accent-bg-color);
+  box-shadow: 0 0 0 3px #ffffff;
+}

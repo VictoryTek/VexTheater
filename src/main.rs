@@ -1,5 +1,6 @@
 //! VexTheater — a full-screen TV launcher for GNOME.
 
+mod browse;
 mod bundle;
 mod catalog;
 mod clock;

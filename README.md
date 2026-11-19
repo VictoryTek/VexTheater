@@ -125,6 +125,15 @@ menu, the Add page and the confirmations have none.
   like any tile; a tile put back returns to the place the saved order had it in. With
   nothing to add, the page holds only "Setup & health" (see Troubleshooting), which is
   always its last tile.
+- The **magnifier** button, left of **+** (or `/`, or Ctrl+F, on the main row), opens
+  "Browse all": every app tile you can reach, from the main row and from the submenus it
+  opens, each with where it is ("in Games", and "2 of 3" when several are called the same).
+  Type to filter (every word must match the name, the description or the place), or use
+  the letter groups under the box: Down from the box, then Left and Right and Enter.
+  Enter on a result starts it like its own tile, and coming back selects the main-row tile
+  that led to it. Tiles you removed, submenus nothing opens, and power actions are not
+  listed. Escape clears the box, and goes back once it is empty. Browsing never changes
+  what is saved, and only looks at your own tiles.
 
 Holding Back for two seconds on the main row asks to reset the tile order to the
 configured one, after confirmation (Cancel is selected first). It resets the order only,

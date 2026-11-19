@@ -2,6 +2,7 @@
 //! each submenu), with keyboard and mouse navigation. Also theater and desktop mode:
 //! the launcher is shown full screen, or hidden to leave the GNOME desktop.
 
+use crate::browse;
 use crate::catalog;
 use crate::clock::Clock;
 use crate::config::{Action, Builtin, Config, Tile};
@@ -133,6 +134,9 @@ enum Page {
     /// What the launcher needs from its session, checked; made again each time it
     /// opens and when the checks are run again.
     Health,
+    /// Every app tile that can be reached, with a filter; made again each time it opens
+    /// and when the filter changes.
+    Browse,
 }
 
 /// What a confirmation page asks about: the actions that power the machine off or
@@ -186,6 +190,7 @@ impl Page {
     const ADD: &'static str = "add";
     const TILE_OPTIONS: &'static str = "options";
     const HEALTH: &'static str = "health";
+    const BROWSE: &'static str = "browse";
     const SUBMENU_PREFIX: &'static str = crate::model::SUBMENU_PREFIX;
     const CONFIRM_PREFIX: &'static str = "confirm:";
 
@@ -197,6 +202,7 @@ impl Page {
             Page::Add => Self::ADD.to_owned(),
             Page::TileOptions => Self::TILE_OPTIONS.to_owned(),
             Page::Health => Self::HEALTH.to_owned(),
+            Page::Browse => Self::BROWSE.to_owned(),
             Page::Confirm(confirm) => format!("{}{}", Self::CONFIRM_PREFIX, confirm.key()),
         }
     }
@@ -223,6 +229,7 @@ impl Page {
             Self::ADD => Some(Page::Add),
             Self::TILE_OPTIONS => Some(Page::TileOptions),
             Self::HEALTH => Some(Page::Health),
+            Self::BROWSE => Some(Page::Browse),
             _ => None,
         }
     }
@@ -704,6 +711,20 @@ struct Ui {
     /// Which run of the checks the page waits for; the result of an older one, from a page
     /// opened and left since, is dropped.
     health_run: Cell<u64>,
+    /// Browse all: every app tile reachable when it opened, the filter, and what the page
+    /// shows. `browse_hits` holds, for each tile of the page, its index in
+    /// `browse_found`. The search entry lives as long as the launcher, and is put in each
+    /// new copy of the page, so typing in it is not interrupted.
+    browse_found: RefCell<Vec<browse::Found>>,
+    browse_hits: RefCell<Vec<usize>>,
+    browse_entries: RefCell<Vec<Entry>>,
+    browse_query: RefCell<String>,
+    browse_letter: Cell<Option<char>>,
+    /// Enter moved the focus to the results while a filter was still waiting to be
+    /// applied; see `show_browse`.
+    browse_to_results: Cell<bool>,
+    browse_search: gtk::SearchEntry,
+    browse_button: gtk::Button,
     /// The title label of each page that has one, for the pages whose title changes.
     titles: RefCell<HashMap<Page, gtk::Label>>,
     /// Serialises closes; see `close_then`.
@@ -793,6 +814,14 @@ impl Ui {
             .margin_top(64)
             .margin_end(PAGE_MARGIN)
             .build();
+        let browse_button = browse_button();
+        let browse_search = gtk::SearchEntry::builder()
+            .placeholder_text("Search apps")
+            .width_request(560)
+            .halign(gtk::Align::Start)
+            .css_classes(["browse-search"])
+            .build();
+        corner.append(&browse_button);
         corner.append(&plus_button);
         corner.append(&power_button);
         corner.append(&clock.widget);
@@ -871,6 +900,14 @@ impl Ui {
             add_entries: RefCell::default(),
             health_entries: RefCell::default(),
             health_run: Cell::new(0),
+            browse_found: RefCell::default(),
+            browse_hits: RefCell::default(),
+            browse_entries: RefCell::default(),
+            browse_query: RefCell::default(),
+            browse_letter: Cell::new(None),
+            browse_to_results: Cell::new(false),
+            browse_search,
+            browse_button: browse_button.clone(),
             titles: RefCell::default(),
             closes: CloseQueue::new(),
             stack,
@@ -925,10 +962,58 @@ impl Ui {
                 ui.open_add(button);
             }
         });
+        browse_button.connect_clicked({
+            let ui = ui.clone();
+            move |button| {
+                ui.sounds.chosen();
+                ui.stop_arranging();
+                ui.open_browse(button);
+            }
+        });
+        ui.browse_search.connect_search_changed({
+            let ui = ui.clone();
+            move |search| {
+                let text = search.text().to_string();
+                if text != *ui.browse_query.borrow() && ui.current_page() == Page::Browse {
+                    ui.browse_query.replace(text);
+                    ui.show_browse(false);
+                }
+            }
+        });
+        // Escape in the search, which GTK would otherwise take without doing anything:
+        // the first press clears what was typed, the next goes back.
+        ui.browse_search.connect_stop_search({
+            let ui = ui.clone();
+            move |search| {
+                if search.text().is_empty() {
+                    if ui.back() {
+                        ui.sounds.chosen();
+                    }
+                } else {
+                    search.set_text("");
+                }
+            }
+        });
+        // Enter in the search moves on to the results.
+        ui.browse_search.connect_activate({
+            let ui = ui.clone();
+            move |search| {
+                if let Some(first) = ui.first_tiles.borrow().get(&Page::Browse) {
+                    first.grab_focus();
+                    // A filter still waiting would take the focus back when it is applied.
+                    ui.browse_to_results
+                        .set(search.text().as_str() != *ui.browse_query.borrow());
+                }
+            }
+        });
         // The round buttons belong to the main row only.
         ui.stack.connect_visible_child_name_notify({
-            let (ui, power_button, plus_button) =
-                (ui.clone(), power_button.clone(), plus_button.clone());
+            let (ui, power_button, plus_button, browse_button) = (
+                ui.clone(),
+                power_button.clone(),
+                plus_button.clone(),
+                browse_button.clone(),
+            );
             move |stack| {
                 // The hint says what Back does, which depends on the page.
                 ui.update_arrange_hint();
@@ -938,6 +1023,7 @@ impl Ui {
                     == Some(Page::Main);
                 power_button.set_visible(on_main);
                 plus_button.set_visible(on_main);
+                browse_button.set_visible(on_main);
             }
         });
 
@@ -948,7 +1034,7 @@ impl Ui {
         let last_tile: Rc<RefCell<Option<gtk::Widget>>> = Rc::default();
         keys.connect_key_pressed({
             let ui = ui.clone();
-            move |_, key, _, _| match key {
+            move |_, key, _, state| match key {
                 key if is_back(key) && ui.back() => {
                     ui.sounds.chosen();
                     glib::Propagation::Stop
@@ -971,11 +1057,28 @@ impl Ui {
                     power_button.emit_clicked();
                     glib::Propagation::Stop
                 }
+                // Browse all: "/" or Ctrl+F from the main row, and Ctrl+F back to the
+                // search from the results.
+                gtk::gdk::Key::slash if ui.on_main_page() => {
+                    ui.browse_button.emit_clicked();
+                    glib::Propagation::Stop
+                }
+                gtk::gdk::Key::f | gtk::gdk::Key::F
+                    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) =>
+                {
+                    if ui.on_main_page() {
+                        ui.browse_button.emit_clicked();
+                    } else if ui.current_page() == Page::Browse {
+                        ui.browse_search.grab_focus();
+                    }
+                    glib::Propagation::Stop
+                }
                 // From the top row only: Up in a lower row moves up a row.
                 gtk::gdk::Key::Up
                     if ui.on_main_page()
                         && !power_button.is_focus()
                         && !plus_button.is_focus()
+                        && !ui.browse_button.is_focus()
                         && ui.in_top_row() =>
                 {
                     last_tile.replace(GtkWindowExt::focus(&ui.window));
@@ -983,7 +1086,11 @@ impl Ui {
                     ui.sounds.moved();
                     glib::Propagation::Stop
                 }
-                gtk::gdk::Key::Down if power_button.is_focus() || plus_button.is_focus() => {
+                gtk::gdk::Key::Down
+                    if power_button.is_focus()
+                        || plus_button.is_focus()
+                        || ui.browse_button.is_focus() =>
+                {
                     let first = ui.first_tiles.borrow().get(&Page::Main).cloned();
                     if let Some(tile) = last_tile.take().or(first.map(Cast::upcast)) {
                         tile.grab_focus();
@@ -1402,7 +1509,11 @@ impl Ui {
                         return;
                     }
                     ui.sounds.chosen();
-                    ui.activate(&page, &ui.tile(&page, index), button);
+                    if page == Page::Browse {
+                        ui.choose_found(index, button);
+                    } else {
+                        ui.activate(&page, &ui.tile(&page, index), button);
+                    }
                 }
             });
 
@@ -1896,6 +2007,7 @@ impl Ui {
             Page::Submenu(name) => self.submenus.borrow()[name][index].clone(),
             Page::Add => self.add_entries.borrow()[index].clone(),
             Page::Health => self.health_entries.borrow()[index].clone(),
+            Page::Browse => self.browse_entries.borrow()[index].clone(),
             Page::Power | Page::Confirm(_) | Page::TileOptions => self
                 .own_pages
                 .iter()
@@ -2054,20 +2166,257 @@ impl Ui {
             .find(|(shown, _)| *shown == index)
             .ok_or_else(|| format!("\"{name}\" is not shown"))?;
         self.activate(&page, entry, button);
-        if let Page::Submenu(submenu) = &page {
+        if matches!(page, Page::Submenu(_)) {
             // `activate` took the origin from the pages that happen to be open; for a
             // tile chosen from outside it is the main-row tile that leads to the submenu.
-            let arranged = self.arrangeable.borrow();
-            let openers = main_openers(&self.config.borrow(), submenu);
-            let origin = arranged.get(&Page::Main).and_then(|main| {
-                main.buttons
-                    .iter()
-                    .find(|(shown, _)| openers.contains(shown))
-                    .map(|(_, button)| button.downgrade())
-            });
-            self.origin.replace(origin);
+            self.set_origin(&page, index);
         }
         Ok(())
+    }
+
+    /// Notes the main-row tile that `index`, a tile of `page`, belongs to, for a tile
+    /// chosen from a page that is not its own: the tile itself on the main row, else the
+    /// one that opens the submenu.
+    fn set_origin(&self, page: &Page, index: usize) {
+        let openers = match page {
+            Page::Main => vec![index],
+            Page::Submenu(submenu) => main_openers(&self.config.borrow(), submenu),
+            _ => return,
+        };
+        self.set_origin_among(&openers);
+    }
+
+    /// Notes the main-row tile at `index` as the one to select when the launcher comes
+    /// back.
+    fn set_origin_to(&self, index: usize) {
+        self.set_origin_among(&[index]);
+    }
+
+    fn set_origin_among(&self, indexes: &[usize]) {
+        let arranged = self.arrangeable.borrow();
+        let Some(main) = arranged.get(&Page::Main) else {
+            return;
+        };
+        let origin = main
+            .buttons
+            .iter()
+            .find(|(shown, _)| indexes.contains(shown))
+            .map(|(_, button)| button.downgrade());
+        self.origin.replace(origin);
+    }
+
+    /// The tile `found` stands for, as the launcher holds it now.
+    fn entry_of(&self, found: &browse::Found) -> Option<(Page, Entry)> {
+        let page = Page::from_key(&found.page)?;
+        let entry = match &page {
+            Page::Main => self.main.borrow().get(found.index).cloned(),
+            Page::Submenu(name) => self
+                .submenus
+                .borrow()
+                .get(name)
+                .and_then(|tiles| tiles.get(found.index))
+                .cloned(),
+            _ => None,
+        }?;
+        Some((page, entry))
+    }
+
+    /// Every app tile that can be reached now, from the main row on.
+    fn reachable_apps(&self) -> Vec<browse::Found> {
+        let item = |entry: &Entry| browse::Item {
+            description: entry.description.clone(),
+            kind: match &entry.command {
+                Command::Config(Action::Submenu(name)) => browse::Kind::Opens(name.clone()),
+                command if command.app_kind().is_some() => browse::Kind::App,
+                _ => browse::Kind::Other,
+            },
+        };
+        let main = self.main.borrow();
+        let submenus = self.submenus.borrow();
+        let pages: Vec<(crate::model::PageModel, Vec<browse::Item>)> =
+            std::iter::once((Page::Main.key(), &*main))
+                .chain(
+                    submenus
+                        .iter()
+                        .map(|(name, tiles)| (Page::Submenu(name.clone()).key(), tiles)),
+                )
+                .map(|(key, entries)| {
+                    (
+                        entry_page(&key, entries),
+                        entries.iter().map(item).collect(),
+                    )
+                })
+                .collect();
+        browse::reachable(&pages, &self.shown.borrow(), &self.saved_order.borrow())
+    }
+
+    /// Opens Browse all with nothing typed.
+    fn open_browse(self: &Rc<Self>, opener: &gtk::Button) {
+        *self.browse_found.borrow_mut() = self.reachable_apps();
+        self.browse_query.take();
+        self.browse_letter.set(None);
+        self.browse_search.set_text("");
+        self.show_browse(false);
+        self.open(Page::Browse, opener);
+        self.focus_search(-1, None);
+    }
+
+    /// Makes the Browse page again from the filter, in place of the one there. The
+    /// search entry moves to the new page and keeps the focus, or `chip` says the letter
+    /// group that was chosen does.
+    fn show_browse(self: &Rc<Self>, chip: bool) {
+        let found = self.browse_found.borrow().clone();
+        let query = self.browse_query.borrow().clone();
+        let letters = browse::initials(&found, &query);
+        let letter = self.browse_letter.get().filter(|l| letters.contains(l));
+        self.browse_letter.set(letter);
+        let (hits, entries): (Vec<usize>, Vec<Entry>) = browse::matches(&found, &query, letter)
+            .into_iter()
+            .filter_map(|hit| {
+                let (_, entry) = self.entry_of(&found[hit])?;
+                let description = Some(found[hit].detail());
+                Some((
+                    hit,
+                    Entry {
+                        description,
+                        ..entry
+                    },
+                ))
+            })
+            .unzip();
+
+        let shown = self.current_page() == Page::Browse;
+        // Where the cursor is in the search, to put it back after the page is made again.
+        let cursor = self.browse_search.position();
+        let selection = self.browse_search.selection_bounds();
+        // Enter was pressed with a filter still waiting to be applied: the focus is on the
+        // first result by now, and stays there. Otherwise the user is typing, from the
+        // search or from a result (typing there goes to the search), and the cursor returns.
+        let to_results = self.browse_to_results.take();
+        self.browse_search.set_key_capture_widget(gtk::Widget::NONE);
+        if let Some(bar) = self.browse_search.parent().and_downcast::<gtk::Box>() {
+            bar.remove(&self.browse_search);
+        }
+        let transition = self.stack.transition_type();
+        self.stack
+            .set_transition_type(gtk::StackTransitionType::None);
+        self.forget_page(&Page::Browse);
+        *self.browse_hits.borrow_mut() = hits;
+        *self.browse_entries.borrow_mut() = entries.clone();
+        self.add_page(Page::Browse, Some("Browse all"), &entries, false);
+
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(20)
+            .margin_top(28)
+            .build();
+        bar.append(&self.browse_search);
+        let mut chips = Vec::new();
+        if letters.len() > 1 {
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(10)
+                .margin_top(6)
+                .margin_bottom(6)
+                .margin_start(6)
+                .margin_end(6)
+                .build();
+            for group in std::iter::once(None).chain(letters.iter().copied().map(Some)) {
+                let chip = gtk::Button::builder()
+                    .label(group.map_or("All".to_owned(), |l| l.to_string()))
+                    .css_classes(if group == letter {
+                        vec!["letter-chip", "current"]
+                    } else {
+                        vec!["letter-chip"]
+                    })
+                    .build();
+                chip.connect_clicked({
+                    let ui = self.clone();
+                    move |_| {
+                        ui.sounds.chosen();
+                        ui.browse_letter.set(group);
+                        ui.show_browse(true);
+                    }
+                });
+                row.append(&chip);
+                chips.push((group, chip));
+            }
+            // Many letters need more than a screen is wide: the row scrolls to the focused
+            // one instead of running off.
+            let scroller = gtk::ScrolledWindow::builder()
+                .child(&row)
+                .hscrollbar_policy(gtk::PolicyType::External)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .build();
+            bar.append(&scroller);
+        }
+        if let Some(column) = self
+            .stack
+            .child_by_name(&Page::Browse.key())
+            .and_downcast::<gtk::Box>()
+        {
+            if let Some(header) = column.first_child() {
+                column.insert_child_after(&bar, Some(&header));
+            }
+            self.browse_search.set_key_capture_widget(Some(&column));
+        }
+        if self.width.get() > 0 {
+            self.fit_tiles(self.width.get(), self.height.get());
+        }
+        if shown {
+            self.stack.set_visible_child_name(&Page::Browse.key());
+            match chips.iter().find(|(group, _)| chip && *group == letter) {
+                Some((_, chip)) => {
+                    chip.grab_focus();
+                }
+                None if to_results => match self.first_tiles.borrow().get(&Page::Browse) {
+                    Some(first) => {
+                        first.grab_focus();
+                    }
+                    None => self.focus_search(cursor, selection),
+                },
+                None => self.focus_search(cursor, selection),
+            }
+        }
+        self.stack.set_transition_type(transition);
+    }
+
+    /// Puts the cursor in the search entry at `position` (-1 for the end), with the text
+    /// kept and `selection` selected again.
+    fn focus_search(&self, position: i32, selection: Option<(i32, i32)>) {
+        self.browse_search.grab_focus();
+        self.browse_search.set_position(position);
+        if let Some((start, end)) = selection {
+            // The cursor is at the second end given: keep it where it was, so the
+            // selection goes on growing the way the user was moving it.
+            if position == start {
+                self.browse_search.select_region(end, start);
+            } else {
+                self.browse_search.select_region(start, end);
+            }
+        }
+    }
+
+    /// A result of Browse all was chosen: what a choice of the tile itself does, as if
+    /// from its own page, and the launcher comes back to the main-row tile that leads to it.
+    fn choose_found(self: &Rc<Self>, hit: usize, button: &gtk::Button) {
+        let found = {
+            let hits = self.browse_hits.borrow();
+            let all = self.browse_found.borrow();
+            hits.get(hit).and_then(|index| all.get(*index)).cloned()
+        };
+        let Some((found, (page, entry))) =
+            found.and_then(|found| self.entry_of(&found).map(|tile| (found, tile)))
+        else {
+            return;
+        };
+        self.activate(&page, &entry, button);
+        // `activate` took the origin from this page; it is the main-row tile that leads
+        // to the app. Not for an app that did not start.
+        if self.installed(&entry.command) {
+            self.set_origin_to(found.via);
+        }
     }
 
     /// One app at a time: the previous one is closed, and the new one starts once it
@@ -2917,8 +3266,23 @@ fn empty_page_text(page: &Page) -> Option<(&'static str, &'static str)> {
     match page {
         Page::Main => Some(("No tiles yet", "Press + to add some")),
         Page::Submenu(_) => Some(("No tiles here", "Put them back with + on the main row")),
+        Page::Browse => Some(("No apps match", "Change the search, or pick All")),
         _ => None,
     }
+}
+
+/// Top-right, left of "+": the way into Browse all.
+fn browse_button() -> gtk::Button {
+    let icon = gtk::Image::from_icon_name("system-search-symbolic");
+    icon.set_pixel_size(32);
+    let button = gtk::Button::builder()
+        .child(&icon)
+        .css_classes(["power-button"])
+        .valign(gtk::Align::Start)
+        .margin_top(8)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("Browse all")]);
+    button
 }
 
 /// Top-right, left of the power button: the way into the Add page.
